@@ -1,3 +1,11 @@
+#ADDITIONAL INFORMATION FOR OPENMANDRIVA
+- NEED PACKAGES conky lib64c++ lib64c++abi lib64unwind1.0 lua AND imlib2 libxft imv imagemagick for proper image support. lib64imlib2-devel required. libxft-devel recommended. imv for display. imagemagick for image conversion, use latest version and install with an asterisk.
+- Please check the basic exaple provided in example directory for a basic slideshow. example directory MUST BE DELETED before attempting to compile, assume compilation failure otherwise.
+- RECOMMENDED TO DOWNLOAD LATEST RELEASE FROM BRNDNMTTHWS; RECOMMENDED TO CREATE A SYMLINK "conky"; sudo cp ~/conky /usr/bin; sudo chmod x+ /usr/bin/conky
+- To update, either git pull if manual compiling or delete and recreate symlink following above bullet.
+- NOT RECOMMENDED (will cause issues): USING A VERSION PRIOR TO 1.22.0
+- You may need to adjust the path directories in the example to get it to function.
+
 [![Linux build](https://github.com/brndnmtthws/conky/actions/workflows/build-and-test-linux.yaml/badge.svg)](https://github.com/brndnmtthws/conky/actions/workflows/build-and-test-linux.yaml) [![macOS build](https://github.com/brndnmtthws/conky/actions/workflows/build-and-test-macos.yaml/badge.svg)](https://github.com/brndnmtthws/conky/actions/workflows/build-and-test-macos.yaml) [![Docker build](https://github.com/brndnmtthws/conky/actions/workflows/docker.yaml/badge.svg)](https://github.com/brndnmtthws/conky/actions/workflows/docker.yaml) [![AppImage build](https://github.com/brndnmtthws/conky/actions/workflows/publish-appimage.yml/badge.svg)](https://github.com/brndnmtthws/conky/actions/workflows/publish-appimage.yml)
 
 [📕 Documentaton](https://conky.cc/)

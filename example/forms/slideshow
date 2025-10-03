@@ -1,0 +1,28 @@
+#!/bin/sh
+ 
+##########################################################################
+##               conky slideshow by Christian Brassat                   ##
+##				v 0.0.2					##
+##                           aka. k3ttc4r                               ##
+##                          GNU GPLv3 2009                              ##
+##########################################################################
+ 
+##########################################################################
+# Settings
+##########################################################################
+ 
+directory='./forms/'		    	# Directory containing the script and the pictures
+ 
+##########################################################################
+# Script (do not change unless you know what you're doing)
+##########################################################################
+ 
+# Creates an array from all pictures
+files=("${directory}"/pics/*.*)        # create an array of the files.
+N=${#files[@]}                     	# Number of members in the array
+((N=RANDOM%N))
+randomfile=${files[${N}]}
+ 
+# Sets picture from random file
+cp "${randomfile}" "${directory}"/current.png
+
