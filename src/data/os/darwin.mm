@@ -43,7 +43,9 @@
  */
 
 #include "../../conky.h"  // for struct info
+#include "../../logging.h"
 #include "darwin.h"
+#include "darwin_top_helpers.h"
 
 #include <AvailabilityMacros.h>
 
@@ -198,20 +200,6 @@ static void helper_update_threads_processes() {
 }
 
 /*
- * useful info about the cpu used by functions such as update_cpu_usage() and
- * get_top_info()
- */
-struct cpusample {
-  uint64_t totalUserTime;   /* ticks of CPU in userspace */
-  uint64_t totalSystemTime; /* ticks of CPU in kernelspace */
-  uint64_t totalIdleTime;   /* ticks in idleness */
-
-  uint64_t total;          /* delta of current and previous */
-  uint64_t current_total;  /* total CPU ticks of current iteration */
-  uint64_t previous_total; /* total CPU tick of previous iteration */
-};
-
-/*
  * Memory sample
  */
 typedef struct memorysample {
@@ -259,11 +247,7 @@ static void get_cpu_sample(struct cpusample **sample) {
   /*
    * sum up all totals
    */
-  for (natural_t i = 1; i < processorCount + 1; i++) {
-    (*sample)[0].totalSystemTime += (*sample)[i].totalSystemTime;
-    (*sample)[0].totalUserTime += (*sample)[i].totalUserTime;
-    (*sample)[0].totalIdleTime += (*sample)[i].totalIdleTime;
-  }
+  sum_cpu_sample_overall(*sample, processorCount);
 
   /*
    * Dealloc
@@ -313,14 +297,14 @@ static int helper_get_proc_list(struct kinfo_proc **p) {
   err = sysctl((int *)name, (sizeof(name) / sizeof(*name)) - 1, nullptr,
                &length, nullptr, 0);
   if (err != 0) {
-    perror(nullptr);
+    LOG_ERROR("sysctl failed to get process list size: {}", strerror(errno));
     return (-1);
   }
 
   /* Allocate buffer */
   *p = static_cast<kinfo_proc *>(malloc(length));
   if (p == nullptr) {
-    perror(nullptr);
+    LOG_ERROR("failed to allocate process list buffer: {}", strerror(errno));
     return (-1);
   }
 
@@ -328,7 +312,7 @@ static int helper_get_proc_list(struct kinfo_proc **p) {
   err = sysctl((int *)name, (sizeof(name) / sizeof(*name)) - 1, *p, &length,
                nullptr, 0);
   if (err != 0) {
-    perror(nullptr);
+    LOG_ERROR("sysctl failed to get process list: {}", strerror(errno));
     return (-1);
   }
 
@@ -371,7 +355,7 @@ static int swapmode(unsigned long *retavail, unsigned long *retfree) {
     *retfree = swapUsage.xsu_avail / 1024;
     *retavail = swapUsage.xsu_total / 1024;
   } else {
-    perror("sysctl");
+    LOG_ERROR("sysctl: {}", strerror(errno));
     return (-1);
   }
 
@@ -393,7 +377,7 @@ int update_uptime() {
     time(&now);
     info.uptime = now - boottime.tv_sec;
   } else {
-    fprintf(stderr, "could not get uptime\n");
+    LOG_ERROR("could not get uptime");
     info.uptime = 0;
   }
 
@@ -417,7 +401,7 @@ int check_mount(struct text_object *obj) {
   num_mounts = getmntinfo(&mounts, MNT_WAIT);
 
   if (num_mounts < 0) {
-    NORM_ERR("could not get mounts using getmntinfo");
+    LOG_ERROR("could not get mounts using getmntinfo");
     return 0;
   }
 
@@ -919,7 +903,7 @@ void get_cpu_count() {
   if (GETSYSCTL("hw.activecpu", cpu_count) == 0) {
     info.cpu_count = cpu_count;
   } else {
-    fprintf(stderr, "Cannot get hw.activecpu\n");
+    LOG_ERROR("cannot get hw.activecpu");
     info.cpu_count = 0;
   }
 
@@ -929,7 +913,7 @@ void get_cpu_count() {
      */
     info.cpu_usage =
         static_cast<float *>(malloc((info.cpu_count + 1) * sizeof(float)));
-    if (info.cpu_usage == nullptr) { CRIT_ERR("malloc"); }
+    if (info.cpu_usage == nullptr) { SYSTEM_ERR("failed to allocate cpu_usage array"); }
   }
 }
 
@@ -1151,6 +1135,11 @@ static void calc_cpu_usage_for_proc(struct process *proc, uint64_t total) {
   float mul = 100.0;
   if (top_cpu_separate.get(*state)) { mul *= info.cpu_count; }
 
+  if (total == 0) {
+    proc->amount = 0.0f;
+    return;
+  }
+
   proc->amount =
       mul * (proc->user_time + proc->kernel_time) / static_cast<float>(total);
 }
@@ -1169,10 +1158,14 @@ static void calc_cpu_total(struct process *proc, uint64_t *total) {
   current_total =
       sample[0].totalUserTime + sample[0].totalIdleTime + sample[0].totalSystemTime;
 
-  *total = current_total - proc->previous_total_cpu_time;
-  proc->previous_total_cpu_time = current_total;
+  uint64_t delta = cpu_total_delta(current_total, &proc->previous_total_cpu_time);
 
-  *total = ((*total / sysconf(_SC_CLK_TCK)) * 100) / info.cpu_count;
+  if (delta == 0) {
+    *total = 0;
+    return;
+  }
+
+  *total = (delta / sysconf(_SC_CLK_TCK)) * 100;
 }
 
 /*
@@ -1186,13 +1179,8 @@ static void calc_cpu_time_for_proc(struct process *process,
   unsigned long long user_time = 0;
   unsigned long long kernel_time = 0;
 
-  process->user_time = pti->pti_total_user;
-  process->kernel_time = pti->pti_total_system;
-
-  /* user_time and kernel_time are in nanoseconds, total_cpu_time in
-   * centiseconds. Therefore we divide by 10^7 . */
-  process->user_time /= 10000000;
-  process->kernel_time /= 10000000;
+  process->user_time = mach_ticks_to_centis_system(pti->pti_total_user);
+  process->kernel_time = mach_ticks_to_centis_system(pti->pti_total_system);
 
   process->total_cpu_time = process->user_time + process->kernel_time;
   if (process->previous_user_time == ULONG_MAX) {
@@ -1356,7 +1344,7 @@ int get_sip_status() {
   if (csr_get_active_config ==
       nullptr) /*  check if weakly linked symbol exists    */
   {
-    NORM_ERR("$sip_status will not work on this version of macOS\n");
+    LOG_WARNING("$sip_status will not work on this version of macOS");
     return 0;
   }
 
@@ -1399,7 +1387,7 @@ void print_sip_status(struct text_object *obj, char *p, unsigned int p_max_size)
       nullptr) /*  check if weakly linked symbol exists    */
   {
     snprintf(p, p_max_size, "%s", "unsupported");
-    NORM_ERR("$sip_status will not work on this version of macOS\n");
+    LOG_WARNING("$sip_status will not work on this version of macOS");
     return;
   }
 
@@ -1470,13 +1458,12 @@ void print_sip_status(struct text_object *obj, char *p, unsigned int p_max_size)
         break;
       default:
         snprintf(p, p_max_size, "%s", "unsupported");
-        NORM_ERR(
-            "print_sip_status: unsupported argument passed to $sip_status");
+        LOG_ERROR("unsupported argument '{}' passed to $sip_status", obj->data.s);
         break;
     }
   } else { /* bad argument */
     snprintf(p, p_max_size, "%s", "unsupported");
-    NORM_ERR("print_sip_status: unsupported argument passed to $sip_status");
+    LOG_ERROR("unsupported argument '{}' passed to $sip_status", obj->data.s);
   }
 }
 
@@ -1516,13 +1503,12 @@ void print_sip_status(struct text_object *obj, char *p, int p_max_size) {
         break;
       default:
         snprintf(p, p_max_size, "%s", "unsupported");
-        NORM_ERR(
-            "print_sip_status: unsupported argument passed to $sip_status");
+        LOG_ERROR("unsupported argument '{}' passed to $sip_status", obj->data.s);
         break;
     }
   } else { /* bad argument */
     snprintf(p, p_max_size, "%s", "unsupported");
-    NORM_ERR("print_sip_status: unsupported argument passed to $sip_status");
+    LOG_ERROR("unsupported argument '{}' passed to $sip_status", obj->data.s);
   }
 }
 

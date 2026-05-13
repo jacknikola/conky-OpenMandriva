@@ -83,9 +83,9 @@ class out_to_http_setting : public conky::simple_config_setting<bool> {
     if (init && do_convert(l, -1).first) {
       /* warn about old default port */
       if (http_port.get(*state) == 10080) {
-        NORM_ERR(
-            "warning: port 10080 is blocked by browsers "
-            "like Firefox and Chromium, you may want to change http_port.");
+        LOG_WARNING(
+            "port {} is blocked by browsers like Firefox and Chromium, "
+            "you may want to change http_port", http_port.get(*state));
       }
       httpd =
           MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, http_port.get(*state),
@@ -124,6 +124,36 @@ std::string string_replace_all(std::string original, const std::string &oldpart,
   return original;
 }
 
+std::string html_escape(const std::string &input) {
+  std::string escaped;
+  escaped.reserve(input.size());
+
+  for (char ch : input) {
+    switch (ch) {
+      case '&':
+        escaped.append("&amp;");
+        break;
+      case '<':
+        escaped.append("&lt;");
+        break;
+      case '>':
+        escaped.append("&gt;");
+        break;
+      case '"':
+        escaped.append("&quot;");
+        break;
+      case '\'':
+        escaped.append("&#39;");
+        break;
+      default:
+        escaped.push_back(ch);
+        break;
+    }
+  }
+
+  return escaped;
+}
+
 //}  // namespace priv
 
 display_output_http::display_output_http() : display_output_base("http") {
@@ -132,7 +162,7 @@ display_output_http::display_output_http() : display_output_base("http") {
 
 bool display_output_http::detect() {
   if (/*priv::*/ out_to_http.get(*state)) {
-    DBGP2("Display output '%s' enabled in config.", name.c_str());
+    LOG_DEBUG("display output '{}' enabled in config", name);
     return true;
   }
   return false;
@@ -174,7 +204,7 @@ void display_output_http::end_draw_text() { webpage.append(WEBPAGE_END); }
 
 void display_output_http::draw_string(const char *s, int) {
   std::string::size_type origlen = webpage.length();
-  webpage.append(s);
+  webpage.append(html_escape(s));
   webpage = string_replace_all(webpage, "\n", "<br />", origlen);
   webpage = string_replace_all(webpage, "  ", "&nbsp;&nbsp;", origlen);
   webpage = string_replace_all(webpage, "&nbsp; ", "&nbsp;&nbsp;", origlen);

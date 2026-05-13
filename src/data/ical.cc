@@ -110,15 +110,12 @@ void parse_ical_args(struct text_object *obj, const char *arg,
 
   if (sscanf(arg, "%d %s", &num, filename) != 2) {
     free(filename);
-    free(obj);
-    CRIT_ERR_FREE(free_at_crash, free_at_crash2,
-                  "wrong number of arguments for $ical");
+    COMMAND_ARG_ERR("ical", "wrong number of arguments for $ical");
   }
   file = fopen(filename, "r");
   if (!file) {
-    free(obj);
-    free(free_at_crash);
-    CRIT_ERR_FREE(filename, free_at_crash2, "Can't read file %s", filename);
+    SYSTEM_ERR("can't read file '{}'", filename);
+    free(filename);
     return;
   }
   free(filename);
@@ -130,7 +127,7 @@ void parse_ical_args(struct text_object *obj, const char *arg,
   if (!curc) {
     icalparser_free(parser);
     icalcomponent_free(allc);
-    NORM_ERR("No ical events available");
+    LOG_WARNING("no ical events available");
     return;
   }
   ll_start = add_event(nullptr, curc);

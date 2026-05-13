@@ -25,12 +25,16 @@
 #include <cstring>
 #include <filesystem>
 #include <sstream>
+#if defined(BUILD_LUA_CAIRO) || defined(BUILD_WAYLAND)
+#include <cairo.h>
+#endif
 
 #include "../conky.h"
 #include "../geometry.h"
 #include "../logging.h"
 #include "build.h"
 #include "llua.h"
+#include "../output/display-output.hh"
 
 #ifdef BUILD_GUI
 #include "../output/gui.h"
@@ -179,6 +183,22 @@ static int llua_conky_set_update_interval(lua_State *L) {
   return 0; /* number of results */
 }
 
+static int llua_conky_surface(lua_State *L) {
+  auto *output = display_output();
+  if (output == nullptr) {
+    lua_pushnil(L);
+    return 1;
+  }
+  auto weak = output->drawing_surface();
+  auto surface = weak.lock();
+  if (!surface) {
+    lua_pushnil(L);
+    return 1;
+  }
+  tolua_pushusertype(L, surface.get(), "cairo_surface_t");
+  return 1;
+}
+
 void llua_init() {
   std::string libs(PACKAGE_LIBDIR "/lib?.so;");
   std::string old_path, new_path;
@@ -250,9 +270,13 @@ void llua_init() {
   lua_pushcfunction(lua_L, &llua_conky_set_update_interval);
   lua_setglobal(lua_L, "conky_set_update_interval");
 
-#if defined(BUILD_X11)
+  lua_pushcfunction(lua_L, &llua_conky_surface);
+  lua_setglobal(lua_L, "conky_surface");
+
   /* register tolua++ user types */
   tolua_open(lua_L);
+  tolua_usertype(lua_L, "cairo_surface_t");
+#if defined(BUILD_X11)
   tolua_usertype(lua_L, "Drawable");
   tolua_usertype(lua_L, "Visual");
   tolua_usertype(lua_L, "Display");
@@ -318,7 +342,7 @@ void llua_load(const char *script) {
     }
 
     if (!found_alternative) {
-      NORM_ERR("llua_load: specified script file '%s' doesn't exist", script);
+      LOG_ERROR("lua script '{}' not found", script);
       // return without initializing lua_L because other parts of the code rely
       // on it being null if the script is not loaded
       return;
@@ -327,7 +351,7 @@ void llua_load(const char *script) {
 
   error = luaL_dofile(lua_L, path.c_str());
   if (error != 0) {
-    NORM_ERR("llua_load: %s", lua_tostring(lua_L, -1));
+    LOG_ERROR("lua load error in '{}': {}", path, lua_tostring(lua_L, -1));
     lua_pop(lua_L, 1);
 #ifdef HAVE_SYS_INOTIFY_H
   } else if (!llua_block_notify && inotify_fd != -1) {
@@ -365,7 +389,7 @@ static const char *tokenize(const char *str, size_t *len) {
   }
 
   if (str != nullptr && (str[*len] == 0) && level > 0) {
-    NORM_ERR("tokenize: improperly nested token: %s", str);
+    LOG_ERROR("improperly nested token in lua call: {}", str);
   }
 
   return str;
@@ -405,7 +429,7 @@ static char *llua_do_call(const char *string, int retc) {
   }
 
   if (lua_pcall(lua_L, argc, retc, 0) != 0) {
-    NORM_ERR("llua_do_call: function %s execution failed: %s", func,
+    LOG_ERROR("lua function '{}' execution failed: {}", func,
              lua_tostring(lua_L, -1));
     lua_pop(lua_L, -1);
     return nullptr;
@@ -430,7 +454,7 @@ static char *llua_do_read_call(const char *function, const char *arg, int retc)
 	lua_pushstring(lua_L, arg);
 
 	if (lua_pcall(lua_L, 1, retc, 0) != 0) {
-		NORM_ERR("llua_do_call: function %s execution failed: %s", func, lua_tostring(lua_L, -1));
+		LOG_ERROR("lua function '{}' execution failed: {}", func, lua_tostring(lua_L, -1));
 		lua_pop(lua_L, -1);
 		return nullptr;
 	}
@@ -447,9 +471,8 @@ static char *llua_getstring(const char *args) {
   func = llua_do_call(args, 1);
   if (func != nullptr) {
     if (lua_isstring(lua_L, -1) == 0) {
-      NORM_ERR(
-          "llua_getstring: function %s didn't return a string, result "
-          "discarded",
+      LOG_WARNING(
+          "lua function '{}' did not return a string, result discarded",
           func);
     } else {
       ret = strdup(lua_tostring(lua_L, -1));
@@ -472,7 +495,7 @@ static char *llua_getstring_read(const char *function, const char *arg)
 	func = llua_do_read_call(function, arg, 1);
 	if (func) {
 		if(!lua_isstring(lua_L, -1)) {
-			NORM_ERR("llua_getstring_read: function %s didn't return a string, result discarded", func);
+			LOG_WARNING("lua function '{}' did not return a string, result discarded", func);
 		} else {
 			ret = strdup(lua_tostring(lua_L, -1));
 			lua_pop(lua_L, 1);
@@ -490,9 +513,8 @@ static int llua_getnumber(const char *args, double *ret) {
   func = llua_do_call(args, 1);
   if (func != nullptr) {
     if (lua_isnumber(lua_L, -1) == 0) {
-      NORM_ERR(
-          "llua_getnumber: function %s didn't return a number, result "
-          "discarded",
+      LOG_WARNING(
+          "lua function '{}' did not return a number, result discarded",
           func);
     } else {
       *ret = lua_tonumber(lua_L, -1);
@@ -562,7 +584,7 @@ void llua_inotify_query(int wd, int mask) {
         llua_block_notify = 1;
         llua_load(head->name);
         llua_block_notify = 0;
-        NORM_ERR("Lua script '%s' reloaded", head->name);
+        LOG_INFO("lua script '{}' reloaded", head->name);
         if (mask & IN_IGNORED) {
           /* for some reason we get IN_IGNORED here
            * sometimes, so we need to re-add the watch */
@@ -621,20 +643,20 @@ bool llua_mouse_hook(const EventT &ev) {
       // TODO: (1.22.0) Force conky_ prefix on use_mouse_hook like llua_do_call
       // does
       // - keep only else case, remove ty_raw and make hook_name const.
-      NORM_ERR(
-          "llua_mouse_hook: hook %s declaration is missing 'conky_' prefix",
-          raw_hook_name.c_str());
+      LOG_WARNING(
+          "lua mouse hook '{}' is missing 'conky_' prefix",
+          raw_hook_name);
       hook_name = raw_hook_name;
       ty = ty_raw;
       lua_insert(lua_L, -2);
       lua_pop(lua_L, 1);
     } else {
-      NORM_ERR("llua_mouse_hook: hook %s is not defined", hook_name.c_str());
+      LOG_ERROR("lua mouse hook '{}' is not defined", hook_name);
       lua_pop(lua_L, 2);
       return false;
     }
   } else if (ty != LUA_TFUNCTION) {
-    NORM_ERR("llua_mouse_hook: hook %s is not a function", hook_name.c_str());
+    LOG_ERROR("lua mouse hook '{}' is not a function", hook_name);
     lua_pop(lua_L, 1);
     return false;
   }
@@ -643,7 +665,7 @@ bool llua_mouse_hook(const EventT &ev) {
 
   bool result = false;
   if (lua_pcall(lua_L, 1, 1, 0) != LUA_OK) {
-    NORM_ERR("llua_mouse_hook: hook %s execution failed: %s", hook_name.c_str(),
+    LOG_ERROR("lua mouse hook '{}' execution failed: {}", hook_name,
              lua_tostring(lua_L, -1));
     lua_pop(lua_L, 1);
   } else {
@@ -669,7 +691,8 @@ void llua_set_userdata(const char *key, const char *type, void *value) {
   lua_setfield(lua_L, -2, key);
 }
 
-void llua_setup_window_table(conky::rect<int> text_rect) {
+void llua_setup_window_table(conky::vec2i window_size,
+                             conky::rect<int> text_rect) {
   lua_newtable(lua_L);
 
 #ifdef BUILD_X11
@@ -682,10 +705,9 @@ void llua_setup_window_table(conky::rect<int> text_rect) {
 
 #ifdef BUILD_GUI
   if (out_to_gui(*state)) {
-#ifdef BUILD_X11
-    llua_set_number("width", window.geometry.width());
-    llua_set_number("height", window.geometry.height());
-#endif /*BUILD_X11*/
+    llua_set_number("width", window_size.x());
+    llua_set_number("height", window_size.y());
+    
     llua_set_number("border_inner_margin", border_inner_margin.get(*state));
     llua_set_number("border_outer_margin", border_outer_margin.get(*state));
     llua_set_number("border_width", border_width.get(*state));
@@ -696,11 +718,13 @@ void llua_setup_window_table(conky::rect<int> text_rect) {
     llua_set_number("text_height", text_rect.height());
 
     lua_setglobal(lua_L, "conky_window");
+    llua_update_window_table(window_size, text_rect);
   }
 #endif /*BUILD_GUI*/
 }
 
-void llua_update_window_table(conky::rect<int> text_rect) {
+void llua_update_window_table(conky::vec2i window_size,
+                              conky::rect<int> text_rect) {
   lua_getglobal(lua_L, "conky_window");
   if (lua_isnil(lua_L, -1)) {
     /* window table isn't populated yet */
@@ -708,10 +732,28 @@ void llua_update_window_table(conky::rect<int> text_rect) {
     return;
   }
 
-#ifdef BUILD_X11
-  llua_set_number("width", window.geometry.width());
-  llua_set_number("height", window.geometry.height());
-#endif /*BUILD_X11*/
+  /* Determine device scale from the drawing surface. */
+  double scale_x = 1.0, scale_y = 1.0;
+#if defined(BUILD_LUA_CAIRO) || defined(BUILD_WAYLAND)
+  auto *output = display_output();
+  if (output) {
+    auto weak = output->drawing_surface();
+    auto surface = weak.lock();
+    if (surface) {
+      cairo_surface_get_device_scale(surface.get(), &scale_x, &scale_y);
+    }
+  }
+#endif
+
+  llua_set_number("width", window_size.x());
+  llua_set_number("height", window_size.y());
+
+  lua_newtable(lua_L);
+  llua_set_number("x", static_cast<int>(window_size.x() * scale_x));
+  llua_set_number("y", static_cast<int>(window_size.y() * scale_y));
+  lua_setfield(lua_L, -2, "pixel_size");
+
+  llua_set_number("scale", scale_x);
 
   llua_set_number("text_start_x", text_rect.x());
   llua_set_number("text_start_y", text_rect.y());

@@ -29,8 +29,14 @@
 #ifndef _SPECIALS_H
 #define _SPECIALS_H
 
+#include <string>
 #include <tuple>
+#include <variant>
+#include <vector>
 #include "colours.hh"
+
+using graph_data_key = std::variant<std::monostate, std::string, size_t>;
+inline const graph_data_key graph_parent_obj_key = std::monostate{};
 
 /* special stuff in text_buffer */
 
@@ -71,11 +77,11 @@ struct special_node {
   short height;
   short width;
   double arg;
-  double *graph;
+  std::vector<double> graph_data;
+  size_t data_hash; /* identifies the data source; detects slot reuse */
   double scale; /* maximum value */
   short show_scale;
   int graph_width;
-  int graph_allocated;
   int scaled; /* auto adjust maximum */
   int scale_log;
   bool colours_set;
@@ -104,7 +110,8 @@ const char *scan_gauge(struct text_object *, const char *, double);
 #ifdef BUILD_GUI
 void scan_font(struct text_object *, const char *);
 std::pair<char *, size_t> scan_command(const char *);
-bool scan_graph(struct text_object *, const char *, double, char);
+bool scan_graph(struct text_object *, const char *, double, char,
+                graph_data_key key = graph_parent_obj_key);
 void scan_tab(struct text_object *, const char *);
 void scan_stippled_hr(struct text_object *, const char *);
 
@@ -126,8 +133,6 @@ void new_alignr(struct text_object *, char *, unsigned int);
 void new_alignc(struct text_object *, char *, unsigned int);
 void new_goto(struct text_object *, char *, unsigned int);
 void new_tab(struct text_object *, char *, unsigned int);
-
-void clear_stored_graphs();
 
 struct special_node *new_special(char *buf, enum text_node_t t);
 

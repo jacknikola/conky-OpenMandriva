@@ -175,8 +175,7 @@ const char builtin_config_magic[] = "==builtin==";
 // #define SIGNAL_BLOCKING
 #undef SIGNAL_BLOCKING
 
-/* debugging level, used by logging.h */
-int global_debug_level = 0;
+void clean_up(void);
 
 /* disable inotify auto reload feature if desired */
 static conky::simple_config_setting<bool> disable_auto_reload(
@@ -638,7 +637,7 @@ void generate_text_internal(char *p, int p_max_size, struct text_object root) {
       (*obj->callbacks.print)(obj, p, p_max_size);
     } else if (obj->callbacks.iftest != nullptr) {
       if ((*obj->callbacks.iftest)(obj) == 0) {
-        DBGP2("jumping");
+        LOG_TRACE("ifblock condition false, skipping to else/endif");
         if (obj->ifblock_next != nullptr) { obj = obj->ifblock_next; }
       }
     } else if (obj->callbacks.barval != nullptr) {
@@ -682,7 +681,7 @@ void evaluate(const char *text, char *p, int p_max_size) {
    */
   extract_variable_text_internal(&subroot, text);
   generate_text_internal(p, p_max_size, subroot);
-  DBGP2("evaluated '%s' to '%s'", text, p);
+  LOG_TRACE("evaluated '{}' to '{}'", text, p);
 
   free_text_objects(&subroot);
 }
@@ -722,9 +721,7 @@ static void generate_text() {
           p[k] = '\n';
           j = 0;
         } else {
-          NORM_ERR(
-              "The end of the text_buffer is reached, increase "
-              "\"text_buffer_size\"");
+          LOG_WARNING("text_buffer end reached (size {}), increase \"text_buffer_size\"", tbs);
         }
       } else {
         j++;
@@ -916,8 +913,6 @@ void update_text_area() {
   {
     text_start = xy;
   }
-  /* update lua window globals */
-  llua_update_window_table(conky::rect<int>(text_start, text_size));
 }
 
 /* drawing stuff */
@@ -1000,17 +995,17 @@ static inline void set_foreground_color(Colour c) {
 
 static inline void draw_graph_bars(special_node *current, std::unique_ptr<Colour[]>& tmpcolour, 
                             conky::vec2i& text_offset, int i, int &j, int w, 
-                            int colour_idx, int cur_x, int by, int h) {
-  double graphheight = current->graph[j] * (h - 1) / current->scale;
+                            int &colour_idx, int cur_x, int by, int h) {
+  double graphheight = current->graph_data[j] * (h - 1) / current->scale;
   /* Check if graphheight is less than the minheight threshold, if so we must change it to the threshold */
   if(graphheight > 0 && current->minheight - graphheight > 0) {
-    current->graph[j] = current->minheight * current->scale / (h - 1);
+    current->graph_data[j] = current->minheight * current->scale / (h - 1);
   }
   if (current->colours_set) {
     if (current->tempgrad != 0) {
       set_foreground_color(tmpcolour[static_cast<int>(
           static_cast<float>(w - 2) -
-          current->graph[j] * (w - 2) /
+          current->graph_data[j] * (w - 2) /
               std::max(static_cast<float>(current->scale),
                         1.0F))]);
     } else {
@@ -1019,9 +1014,9 @@ static inline void draw_graph_bars(special_node *current, std::unique_ptr<Colour
   }
   /* Handle the case where y axis is to be inverted */
   int offsety1 = current->inverty ? by : by + h;
-  int offsety2 = current->inverty ? by +  current->graph[j] * (h - 1) / current->scale
+  int offsety2 = current->inverty ? by +  current->graph_data[j] * (h - 1) / current->scale
                           : round_to_positive_int(static_cast<double>(by) + h -
-                          current->graph[j] * (h - 1) /
+                          current->graph_data[j] * (h - 1) /
                           current->scale);
   /* this is mugfugly, but it works */
   if (display_output()) {
@@ -1305,8 +1300,8 @@ int draw_each_line_inner(char *s, int special_index, int last_special_applied) {
             if (w == 0) {
               w = text_start.x() + text_size.x() - cur_x - 1;
               current->graph_width = std::max(w - 1, 0);
-              if (current->graph_width != current->graph_allocated) {
-                w = current->graph_allocated + 1;
+              if (current->graph_width != static_cast<int>(current->graph_data.size())) {
+                w = static_cast<int>(current->graph_data.size()) + 1;
               }
             }
             if (w < 0) { w = 0; }
@@ -1320,7 +1315,7 @@ int draw_each_line_inner(char *s, int special_index, int last_special_applied) {
             if (display_output()) display_output()->set_line_style(1, true);
 
             /* in case we don't have a graph yet */
-            if (current->graph != nullptr) {
+            if (!current->graph_data.empty()) {
               std::unique_ptr<Colour[]> tmpcolour;
 
               if (current->colours_set) {
@@ -1601,6 +1596,7 @@ static void draw_text() {
 }
 
 void draw_stuff() {
+  auto _scope = LOG_SCOPE("draw");
   for (auto output : display_outputs()) output->begin_draw_stuff();
 
 #ifdef BUILD_GUI
@@ -1664,6 +1660,7 @@ int need_to_update;
 
 /* update_text() generates new text and clears old text area */
 void update_text() {
+  auto _scope = LOG_SCOPE("update_text");
 #ifdef BUILD_IMLIB2
   cimlib_cleanup();
 #endif /* BUILD_IMLIB2 */
@@ -1824,13 +1821,14 @@ void get_system_details() {
 #endif
 
   if (info.system.wm_name != nullptr) {
-    NORM_ERR("'%s' %s session running", info.system.wm_name, session_ty);
+    LOG_INFO("'{}' {} session running", info.system.wm_name, session_ty);
   } else {
-    NORM_ERR("unknown %s session running", session_ty);
+    LOG_INFO("unknown {} session running", session_ty);
   }
 }
 
 void main_loop() {
+  auto _scope = LOG_SCOPE("main_loop");
   int terminate = 0;
 #ifdef SIGNAL_BLOCKING
   sigset_t newmask, oldmask;
@@ -1867,7 +1865,7 @@ void main_loop() {
 #ifdef SIGNAL_BLOCKING
     /* block signals.  we will inspect for pending signals later */
     if (sigprocmask(SIG_BLOCK, &newmask, &oldmask) < 0) {
-      CRIT_ERR("unable to sigprocmask()");
+      SYSTEM_ERR("unable to block signals: {}", strerror(errno));
     }
 #endif
 
@@ -1894,13 +1892,13 @@ void main_loop() {
 #ifdef SIGNAL_BLOCKING
     /* unblock signals of interest and let handler fly */
     if (sigprocmask(SIG_SETMASK, &oldmask, nullptr) < 0) {
-      CRIT_ERR("unable to sigprocmask()");
+      SYSTEM_ERR("unable to restore signal mask: {}", strerror(errno));
     }
 #endif
 
     if (g_sighup_pending != 0) {
       g_sighup_pending = 0;
-      NORM_ERR("received SIGUSR1. reloading the config file.");
+      LOG_INFO("received SIGUSR1, reloading config file '{}'", current_config);
 
       reload_config();
     }
@@ -1908,7 +1906,7 @@ void main_loop() {
     if (g_sigusr2_pending != 0) {
       g_sigusr2_pending = 0;
       // refresh view;
-      NORM_ERR("received SIGUSR2. refreshing.");
+      LOG_INFO("received SIGUSR2, refreshing");
       update_text();
       draw_stuff();
       for (auto output : display_outputs()) output->flush();
@@ -1916,7 +1914,7 @@ void main_loop() {
 
     if (g_sigterm_pending != 0) {
       g_sigterm_pending = 0;
-      NORM_ERR("received SIGHUP, SIGINT, or SIGTERM to terminate. bye!");
+      LOG_INFO("received termination signal, shutting down");
       terminate = 1;
       for (auto output : display_outputs()) output->sigterm_cleanup();
     }
@@ -1947,7 +1945,7 @@ void main_loop() {
           if (ev->wd == inotify_config_wd &&
               (ev->mask & IN_MODIFY || ev->mask & IN_IGNORED)) {
             /* current_config should be reloaded */
-            NORM_ERR("'%s' modified, reloading...", current_config.c_str());
+            LOG_INFO("'{}' modified, reloading", current_config);
             reload_config();
             if (ev->mask & IN_IGNORED) {
               /* for some reason we get IN_IGNORED here
@@ -1984,13 +1982,12 @@ void main_loop() {
 
 /* reload the config file */
 static void reload_config() {
+  auto _scope = LOG_SCOPE("reload_config");
   struct stat sb {};
   if ((stat(current_config.c_str(), &sb) != 0) ||
       (!S_ISREG(sb.st_mode) && !S_ISLNK(sb.st_mode))) {
-    NORM_ERR(_("Config file '%s' is gone, continuing with config from "
-               "memory.\nIf you recreate this file sent me a SIGUSR1 to tell "
-               "me about it. ( kill -s USR1 %d )"),
-             current_config.c_str(), getpid());
+    LOG_WARNING("config file '{}' is gone, continuing with config from memory (send SIGUSR1 after recreating: kill -s USR1 {})",
+             current_config, getpid());
     return;
   }
   clean_up();
@@ -2003,12 +2000,9 @@ static void reload_config() {
 void free_specials(special_node *&current) {
   if (current != nullptr) {
     free_specials(current->next);
-    if (current->type == text_node_t::GRAPH) { free(current->graph); }
     delete current;
     current = nullptr;
   }
-
-  clear_stored_graphs();
 }
 
 void clean_up(void) {
@@ -2054,6 +2048,11 @@ void clean_up(void) {
   state.reset();
 }
 
+void handle_terminate() {
+  clean_up();
+  std::abort();
+}
+
 static void set_default_configurations() {
   update_uname();
   info.memmax = 0;
@@ -2093,7 +2092,8 @@ static void set_default_configurations() {
 }
 
 void load_config_file() {
-  DBGP(_("reading contents from config file '%s'"), current_config.c_str());
+  auto _scope = LOG_SCOPE("load_config", {{"path", current_config.string()}});
+  LOG_DEBUG("reading contents from config file '{}'", current_config);
 
   lua::state &l = *state;
   lua::stack_sentry s(l);
@@ -2110,21 +2110,15 @@ void load_config_file() {
     }
 #endif
   } catch (lua::syntax_error &e) {
-#define SYNTAX_ERR_READ_CONF "Syntax error (%s) while reading config file. "
 #ifdef BUILD_OLD_CONFIG
-    NORM_ERR(_(SYNTAX_ERR_READ_CONF), e.what());
-    NORM_ERR(_("Assuming it's in old syntax and attempting conversion."));
+    LOG_WARNING("syntax error ({}) while reading config file '{}'", e.what(), current_config);
+    LOG_INFO("assuming old config syntax and attempting conversion");
     // the strchr thingy skips the first line (#! /usr/bin/lua)
     l.loadstring(strchr(convertconf, '\n'));
     l.pushstring(current_config.c_str());
     l.call(1, 1);
 #else
-    char *syntaxerr;
-    if (asprintf(&syntaxerr, _(SYNTAX_ERR_READ_CONF), e.what())) {
-      std::string syntaxerrobj(syntaxerr);
-      free(syntaxerr);
-      throw conky::error(syntaxerrobj);
-    }
+    throw conky::error(fmt::format("syntax error ({}) while reading config file", e.what()));
 #endif
   }
   l.call(0, 0);
@@ -2175,12 +2169,11 @@ void set_current_config() {
 
   /* No readable config found */
   if (current_config.empty()) {
-#define NOCFGFILEFOUND "no personal or system-wide config file found"
 #ifdef BUILD_BUILTIN_CONFIG
     current_config = builtin_config_magic;
-    NORM_ERR(NOCFGFILEFOUND ", using builtin default");
+    LOG_WARNING("no personal or system-wide config file found, using builtin default");
 #else
-    throw conky::error(NOCFGFILEFOUND);
+    throw conky::error("no personal or system-wide config file found");
 #endif
   }
 
@@ -2190,7 +2183,7 @@ void set_current_config() {
 
 /* : means that character before that takes an argument */
 const char *getopt_string =
-    "vVqdDSs:t:u:i:hc:p:"
+    "vVqdDLSs:t:u:i:hc:p:"
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || \
     defined(__HAIKU__) || defined(__NetBSD__) || defined(__OpenBSD__)
     "U"
@@ -2210,7 +2203,8 @@ const char *getopt_string =
 const struct option longopts[] = {
     {"help", 0, nullptr, 'h'},          {"version", 0, nullptr, 'v'},
     {"short-version", 0, nullptr, 'V'}, {"quiet", 0, nullptr, 'q'},
-    {"debug", 0, nullptr, 'D'},         {"config", 1, nullptr, 'c'},
+    {"debug", 0, nullptr, 'D'},         {"concise", 0, nullptr, 'L'},
+    {"config", 1, nullptr, 'c'},
 #ifdef BUILD_BUILTIN_CONFIG
     {"print-config", 0, nullptr, 'C'},
 #endif
@@ -2244,6 +2238,7 @@ void setup_inotify() {
 #endif /* HAVE_SYS_INOTIFY_H */
 }
 void initialisation(int argc, char **argv) {
+  auto _scope = LOG_SCOPE("init");
   struct sigaction act {
   }, oact{};
 
@@ -2261,7 +2256,7 @@ void initialisation(int argc, char **argv) {
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
   if ((kd = kvm_open("/dev/null", "/dev/null", "/dev/null", O_RDONLY,
                      "kvm_open")) == nullptr) {
-    CRIT_ERR("cannot read kvm");
+    SYSTEM_ERR("cannot open kvm (kvm_open failed)");
   }
 #endif
 
@@ -2289,7 +2284,7 @@ void initialisation(int argc, char **argv) {
       case 'm':
         state->pushinteger(strtol(optarg, &conv_end, 10));
         if (*conv_end != 0) {
-          CRIT_ERR("'%s' is a wrong xinerama-head index", optarg);
+          USER_ERR("'{}' is not a valid xinerama-head index", optarg);
         }
         head_index.lua_set(*state);
         break;
@@ -2325,7 +2320,7 @@ void initialisation(int argc, char **argv) {
       case 'u':
         state->pushnumber(strtod(optarg, &conv_end));
         if (*conv_end != 0) {
-          CRIT_ERR("'%s' is an invalid update interval", optarg);
+          USER_ERR("'{}' is not a valid update interval", optarg);
         }
         update_interval.lua_set(*state);
         break;
@@ -2333,7 +2328,7 @@ void initialisation(int argc, char **argv) {
       case 'i':
         state->pushinteger(strtol(optarg, &conv_end, 10));
         if (*conv_end != 0) {
-          CRIT_ERR("'%s' is an invalid number of update times", optarg);
+          USER_ERR("'{}' is not a valid number of update times", optarg);
         }
         total_run_times.lua_set(*state);
         break;
@@ -2341,7 +2336,7 @@ void initialisation(int argc, char **argv) {
       case 'x':
         state->pushinteger(strtol(optarg, &conv_end, 10));
         if (*conv_end != 0) {
-          CRIT_ERR("'%s' is an invalid value for the X-position", optarg);
+          USER_ERR("'{}' is not a valid value for the X-position", optarg);
         }
         gap_x.lua_set(*state);
         break;
@@ -2349,7 +2344,7 @@ void initialisation(int argc, char **argv) {
       case 'y':
         state->pushinteger(strtol(optarg, &conv_end, 10));
         if (*conv_end != 0) {
-          CRIT_ERR("'%s' is a wrong value for the Y-position", optarg);
+          USER_ERR("'{}' is not a valid value for the Y-position", optarg);
         }
         gap_y.lua_set(*state);
         break;
@@ -2360,9 +2355,7 @@ void initialisation(int argc, char **argv) {
           sleep(startup_pause);
         }
         break;
-
-      case '?':
-        throw unknown_arg_throw();
+      // case '?' is handled by main.cc
     }
   }
 
@@ -2383,8 +2376,7 @@ void initialisation(int argc, char **argv) {
 
     switch (pid) {
       case -1:
-        NORM_ERR(PACKAGE_NAME ": couldn't fork() to background: %s",
-                 strerror(errno));
+        LOG_ERROR("couldn't fork to background: {}", strerror(errno));
         break;
 
       case 0:
@@ -2396,10 +2388,8 @@ void initialisation(int argc, char **argv) {
 
       default:
         /* parent process */
-        fprintf(stderr, PACKAGE_NAME ": forked to background, pid is %d\n",
-                pid);
-        fflush(stderr);
-        throw fork_throw();
+        LOG_INFO("forked to background, pid is {}", pid);
+        exit(EXIT_SUCCESS);
     }
   }
 
@@ -2411,11 +2401,13 @@ void initialisation(int argc, char **argv) {
   memset(tmpstring2, 0, text_buffer_size.get(*state));
 
   if (!conky::initialize_display_outputs()) {
-    CRIT_ERR("initialize_display_outputs() failed.");
+    SYSTEM_ERR("no usable display output found");
   }
 #ifdef BUILD_GUI
   /* setup lua window globals */
-  llua_setup_window_table(conky::rect<int>(text_start, text_size));
+  llua_setup_window_table(
+      text_size + conky::vec2i::uniform(get_border_total() * 2),
+      conky::rect<int>(text_start, text_size));
 #endif /* BUILD_GUI */
 
   llua_setup_info(&info, active_update_interval());
@@ -2434,7 +2426,7 @@ void initialisation(int argc, char **argv) {
       sigaction(SIGUSR2, &act, &oact) < 0 ||
       sigaction(SIGHUP, &act, &oact) < 0 ||
       sigaction(SIGTERM, &act, &oact) < 0) {
-    NORM_ERR("error setting signal handler: %s", strerror(errno));
+    LOG_ERROR("error setting signal handler: {}", strerror(errno));
   }
 
   llua_startup_hook();

@@ -54,15 +54,14 @@
 #include "../geometry.h"
 #include "gui.h"
 
-/* true if use_argb_visual=true and argb visual was found*/
-extern bool have_argb_visual;
-
 #define ATOM(a) XInternAtom(display, #a, False)
 
 /// @brief Display where conky is placed
 extern Display *display;
 /// @brief Screen with conky
 extern int screen;
+
+constexpr int argb8888_color_depth = 32;
 
 struct conky_x11_window {
   /// XID of x11 root window
@@ -75,6 +74,21 @@ struct conky_x11_window {
   Visual *visual;
   Colormap colourmap;
   GC gc;
+  
+  /// Background opacity of the window (0-255).
+  /// 
+  /// This is set directly by lua settings - read them directly from
+  /// backend-agnostic code.
+  uint8_t opacity;
+  /// Window buffer color depth.
+  /// 
+  /// Value `32` means X11 supports ARGB8888 (has a compositor).
+  /// Value `24` means only full background transparency is supported (no compositor).
+  /// Value `0` means `CopyFromParent`, i.e. default value, which is always `24`.
+  /// 
+  /// It can be something other than those 3 values (e.g. monochrome displays),
+  /// but that's exceedingly rare.
+  uint8_t color_depth;
 
   // Mask containing all events captured by conky
   int64_t event_mask;
@@ -87,10 +101,8 @@ struct conky_x11_window {
 #ifdef BUILD_XFT
   XftDraw *xftdraw;
 #endif /*BUILD_XFT*/
-#if defined(BUILD_MOUSE_EVENTS) || defined(BUILD_XINPUT)
-  // Don't feature gate with BUILD_XINPUT; controls fallback.
+  /// XInput2 extension opcode; 0 if unavailable.
   std::int32_t xi_opcode;
-#endif /* BUILD_MOUSE_EVENTS || BUILD_XINPUT */
 
   /// @brief Window geometry in screen coordinate space
   conky::rect<int> geometry;
@@ -103,7 +115,7 @@ void update_x11_workarea();
 void init_x11();
 void destroy_window(void);
 void create_gc(void);
-void set_transparent_background(Window win);
+void set_transparent_background(conky_x11_window *win);
 void get_x11_desktop_info(Display *current_display, Atom atom);
 /// @brief Sets reserved area atoms for the conky window to avoid other windows
 /// covering it.
@@ -162,7 +174,7 @@ Window query_x11_top_parent(Display *display, Window child);
 /// @param display display of parent
 /// @param x screen X position contained by window
 /// @param y screen Y position contained by window
-/// @param device_id pointer device id to be queried (will be ignored if BUILD_XINPUT is disabled)
+/// @param device_id pointer device id to be queried
 /// @return a top-most window at provided screen coordinates, or root
 Window query_x11_window_at_pos(Display *display, conky::vec2i pos, int device_id);
 

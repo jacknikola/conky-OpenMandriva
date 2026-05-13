@@ -24,6 +24,7 @@
 #define SETTING_HH
 
 #include <limits>
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -125,14 +126,13 @@ struct lua_traits<T, false, false, true> {
       if (i->first == val) return {i->second, true};
     }
 
-    std::string msg = "Invalid value '" + val + "' for setting '" + name +
-                      "'. Valid values are: ";
+    std::string msg = "invalid value '" + val + "' for setting '" + name +
+                      "', valid values are: ";
     for (auto i = map.begin(); i != map.end(); ++i) {
       if (i != map.begin()) msg += ", ";
       msg += "'" + i->first + "'";
     }
-    msg += ".";
-    NORM_ERR("%s", msg.c_str());
+    LOG_ERROR("{}", msg);
 
     return {T(), false};
   }
@@ -145,11 +145,11 @@ class config_setting_base {
   static int config__newindex(lua::state *l);
   static void make_conky_config(lua::state &l);
 
-  // copying is a REALLY bad idea
   config_setting_base(const config_setting_base &) = delete;
   config_setting_base &operator=(const config_setting_base &) = delete;
 
  protected:
+  config_setting_base(config_setting_base &&other) noexcept;
   /*
    * Set the setting, if the value is sane
    * stack on entry: | ... potential_new_value old_value |
@@ -168,6 +168,7 @@ class config_setting_base {
  public:
   const std::string name;
   const size_t seq_no;
+  std::optional<std::string> deprecation_msg;
 
   static bool seq_compare(const config_setting_base *a,
                           const config_setting_base *b) {
@@ -189,6 +190,13 @@ class config_setting_base {
 };
 }  // namespace priv
 
+/// Mark a config setting as deprecated. Returns the setting by move.
+template <typename T>
+T deprecated(T setting, const char *msg) {
+  setting.deprecation_msg = msg;
+  return setting;
+}
+
 // If you need some very exotic setting, derive it from this class. Otherwise,
 // scroll down.
 template <typename T>
@@ -196,6 +204,7 @@ class config_setting_template : public priv::config_setting_base {
  public:
   explicit config_setting_template(const std::string &name_)
       : config_setting_base(name_) {}
+  config_setting_template(config_setting_template &&) = default;
 
   // get the value of the setting as a C++ type
   T get(lua::state &l);
@@ -253,6 +262,7 @@ class simple_config_setting : public config_setting_template<T> {
       : Base(std::string(name_)),
         default_value(default_value_),
         modifiable(modifiable_) {}
+  simple_config_setting(simple_config_setting &&) = default;
 
  protected:
   const T default_value;
@@ -280,10 +290,10 @@ simple_config_setting<T, Traits>::do_convert(lua::state &l, int index) {
   if (l.isnil(index)) return {default_value, true};
 
   if (l.type(index) != Traits::type) {
-    NORM_ERR(
-        "Invalid value of type '%s' for setting '%s'. "
-        "Expected value of type '%s'.",
-        l.type_name(l.type(index)), Base::name.c_str(),
+    LOG_ERROR(
+        "invalid value of type '{}' for setting '{}', "
+        "expected type '{}'",
+        l.type_name(l.type(index)), Base::name,
         l.type_name(Traits::type));
     return {default_value, false};
   }
@@ -297,7 +307,7 @@ void simple_config_setting<T, Traits>::lua_setter(lua::state &l, bool init) {
 
   bool ok = true;
   if (!init && !modifiable) {
-    NORM_ERR("Setting '%s' is not modifiable", Base::name.c_str());
+    LOG_ERROR("setting '{}' is not modifiable", Base::name);
     ok = false;
   }
 
@@ -344,13 +354,14 @@ class range_config_setting : public simple_config_setting<T, Traits> {
       : Base(name_, default_value_, modifiable_), min(min_), max(max_) {
     assert(min <= Base::default_value && Base::default_value <= max);
   }
+  range_config_setting(range_config_setting &&) = default;
 
  protected:
   virtual std::pair<typename Traits::Type, bool> do_convert(lua::state &l,
                                                             int index) {
     auto ret = Base::do_convert(l, index);
     if (ret.second && !between(ret.first, min, max)) {
-      NORM_ERR("Value is out of range for setting '%s'", Base::name.c_str());
+      LOG_ERROR("value {} is out of range for setting '{}' (expected {}-{})", ret.first, Base::name, min, max);
       // we ignore out-of-range values. an alternative would be to clamp them.
       // do we want to do that?
       ret.second = false;

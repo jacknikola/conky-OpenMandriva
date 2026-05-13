@@ -93,8 +93,8 @@ void get_ibm_acpi_fan(struct text_object *obj, char *p,
       if (sscanf(line, "speed: %u", &speed)) { break; }
     }
   } else {
-    CRIT_ERR(
-        "can't open '%s': %s\nYou are not using the IBM ACPI. Remove "
+    SYSTEM_ERR(
+        "can't open '{}': {}\nYou are not using the IBM ACPI. Remove "
         "ibm* from your " PACKAGE_NAME " config file.",
         fan, strerror(errno));
   }
@@ -144,8 +144,8 @@ int get_ibm_acpi_temps(void) {
       }
     }
   } else {
-    CRIT_ERR(
-        "can't open '%s': %s\nYou are not using the IBM ACPI. Remove "
+    SYSTEM_ERR(
+        "can't open '{}': {}\nYou are not using the IBM ACPI. Remove "
         "ibm* from your " PACKAGE_NAME " config file.",
         thermal, strerror(errno));
   }
@@ -191,8 +191,8 @@ void get_ibm_acpi_volume(struct text_object *obj, char *p,
       if (sscanf(line, "mute: %s", mute)) { break; }
     }
   } else {
-    CRIT_ERR(
-        "can't open '%s': %s\nYou are not using the IBM ACPI. Remove "
+    SYSTEM_ERR(
+        "can't open '{}': {}\nYou are not using the IBM ACPI. Remove "
         "ibm* from your " PACKAGE_NAME " config file.",
         volume, strerror(errno));
   }
@@ -235,8 +235,8 @@ void get_ibm_acpi_brightness(struct text_object *obj, char *p,
       if (sscanf(line, "level: %u", &brightness)) { break; }
     }
   } else {
-    CRIT_ERR(
-        "can't open '%s': %s\nYou are not using the IBM ACPI. Remove "
+    SYSTEM_ERR(
+        "can't open '{}': {}\nYou are not using the IBM ACPI. Remove "
         "ibm* from your " PACKAGE_NAME " config file.",
         filename, strerror(errno));
   }
@@ -275,8 +275,8 @@ void get_ibm_acpi_thinklight(struct text_object *obj, char *p,
       if (sscanf(line, "status: %s", thinklight)) { break; }
     }
   } else {
-    CRIT_ERR(
-        "can't open '%s': %s\nYou are not using the IBM "
+    SYSTEM_ERR(
+        "can't open '{}': {}\nYou are not using the IBM "
         "ACPI. Remove ibm* from your " PACKAGE_NAME " config file.",
         filename, strerror(errno));
   }
@@ -288,9 +288,9 @@ void get_ibm_acpi_thinklight(struct text_object *obj, char *p,
 void parse_ibm_temps_arg(struct text_object *obj, const char *arg) {
   if (!isdigit(arg[0]) || strlen(arg) > 1 || atoi(&arg[0]) >= 8) {
     obj->data.l = 0;
-    NORM_ERR(
-        "Invalid temperature sensor! Sensor number must be 0 to 7. "
-        "Using 0 (CPU temp sensor).");
+    LOG_WARNING(
+        "invalid ibm_temps sensor '{}': must be 0-7, "
+        "falling back to 0 (CPU)", arg);
   } else
     obj->data.l = atoi(arg);
 }

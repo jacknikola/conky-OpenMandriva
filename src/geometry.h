@@ -122,7 +122,7 @@ struct vec {
     static_assert(Length == 4, "constructor only valid for vec4<T>");
   }
 
-  vec(vec<T, Length> &&other) { this->value = other->value; }
+  vec(vec<T, Length> &&other) = default;
 
   static inline vec<T, Length> uniform(T v) {
     std::array<T, Length> data;
@@ -325,14 +325,14 @@ struct vec {
   inline T distance_squared(vec<T, Length> other) const {
     vec<T, Length> buffer = other - *this;
     buffer *= buffer;
-    return std::accumulate(buffer->value.begin(), buffer->value.end(), T{0});
+    return std::accumulate(buffer.value.begin(), buffer.value.end(), T{0});
   }
   inline T distance(vec<T, Length> &other) const {
     return std::sqrt(this->distance_squared(other));
   }
   inline T magnitude_squared() const {
     vec<T, Length> buffer = this->value * this->value;
-    return std::accumulate(buffer->value.begin(), buffer->value.end(), T{0});
+    return std::accumulate(buffer.value.begin(), buffer.value.end(), T{0});
   }
   inline T magnitude() const { return std::sqrt(this->magnitude_squared()); }
 
@@ -397,6 +397,7 @@ struct rect {
 
  public:
   rect() : m_pos(vec2<T>::Zero()), m_other(vec2<T>::Zero()) {}
+  rect(const rect &) = default;
   rect(vec2<T> pos, vec2<T> other) : m_pos(pos), m_other(other) {}
 
   /// @brief Rectangle x position.
@@ -643,5 +644,28 @@ template <typename T>
 using absolute_rect = rect<T, rect_kind::ABSOLUTE>;
 
 }  // namespace conky
+
+// fmt formatters for geometry types
+#include <spdlog/fmt/fmt.h>
+
+template <typename T, size_t Length>
+struct fmt::formatter<conky::vec<T, Length>> : fmt::formatter<T> {
+  auto format(const conky::vec<T, Length> &v, fmt::format_context &ctx) const {
+    fmt::format_to(ctx.out(), "(");
+    for (size_t i = 0; i < Length; i++) {
+      if (i > 0) fmt::format_to(ctx.out(), ", ");
+      fmt::formatter<T>::format(v.at(i), ctx);
+    }
+    return fmt::format_to(ctx.out(), ")");
+  }
+};
+
+template <typename T, conky::rect_kind Kind>
+struct fmt::formatter<conky::rect<T, Kind>> : fmt::formatter<T> {
+  auto format(const conky::rect<T, Kind> &r, fmt::format_context &ctx) const {
+    return fmt::format_to(ctx.out(), "rect({}x{} @ {}, {})",
+                          r.width(), r.height(), r.x(), r.y());
+  }
+};
 
 #endif /* _CONKY_GEOMETRY_H_ */

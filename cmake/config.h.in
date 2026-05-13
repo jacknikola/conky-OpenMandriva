@@ -64,10 +64,6 @@
 
 #cmakedefine BUILD_XFIXES 1
 
-#cmakedefine BUILD_XINPUT 1
-
-#cmakedefine BUILD_ARGB 1
-
 #cmakedefine BUILD_XDBE 1
 
 #cmakedefine BUILD_PORT_MONITORS 1
@@ -132,6 +128,8 @@
 #cmakedefine BUILD_LUA_IMLIB2 1
 
 #cmakedefine BUILD_LUA_RSVG 1
+
+#cmakedefine BUILD_LUA_TEXT 1
 
 #cmakedefine BUILD_IBM 1
 

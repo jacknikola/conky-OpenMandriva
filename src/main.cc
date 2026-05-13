@@ -33,6 +33,7 @@
 #include "build.h"
 #include "config.h"
 #include "conky.h"
+#include "logging.h"
 #include "output/display-output.hh"
 #include "lua/lua-config.hh"
 
@@ -160,7 +161,7 @@ static void print_version() {
 #ifdef DEBUG
             << _("  * Debugging extensions\n")
 #endif
-#if defined BUILD_LUA_CAIRO || defined BUILD_LUA_IMLIB2 || BUILD_LUA_RSVG
+#if defined BUILD_LUA_CAIRO || defined BUILD_LUA_IMLIB2 || BUILD_LUA_RSVG || BUILD_LUA_TEXT
             << _("\n Lua bindings:\n")
 #endif
 #ifdef BUILD_LUA_CAIRO
@@ -171,6 +172,9 @@ static void print_version() {
 #endif /* BUILD_LUA_IMLIB2 */
 #ifdef BUILD_LUA_RSVG
             << _("  * RSVG\n")
+#endif /* BUILD_LUA_RSVG */
+#ifdef BUILD_LUA_TEXT
+            << _("  * TEXT\n")
 #endif /* BUILD_LUA_RSVG */
 #ifdef BUILD_X11
             << _(" X11:\n")
@@ -189,12 +193,8 @@ static void print_version() {
 #ifdef BUILD_XFT
             << _("  * Xft\n")
 #endif /* BUILD_XFT */
-#ifdef BUILD_XINPUT
             << _("  * Xinput\n")
-#endif /* BUILD_XINPUT */
-#ifdef BUILD_ARGB
             << _("  * ARGB visual\n")
-#endif /* BUILD_ARGB */
 #ifdef OWN_WINDOW
             << _("  * Own window\n")
 #endif
@@ -204,9 +204,6 @@ static void print_version() {
 #endif /* BUILD_X11 */
 #ifdef BUILD_WAYLAND
             << _(" Wayland:\n")
-#ifdef BUILD_ARGB
-            << _("  * ARGB visual\n")
-#endif /* BUILD_ARGB */
 #ifdef BUILD_MOUSE_EVENTS
             << _("  * Mouse events\n")
 #endif /* BUILD_MOUSE_EVENTS */
@@ -253,8 +250,10 @@ static void print_help(const char *prog_name) {
          "   -v, --version             version with build details\n"
          "   -V, --short-version       short version\n"
          "   -q, --quiet               quiet mode\n"
-         "   -D, --debug               increase debugging output, ie. -DD for "
-         "more debugging\n"
+         "   -D, --debug               increase logging output, e.g. -DD for "
+         "tracing messages\n"
+         "   -L, --concise             decrease logging output, e.g. -LL for "
+         "only errors\n"
          "   -c, --config=FILE         config file to load\n"
 #ifdef BUILD_BUILTIN_CONFIG
          "   -C, --print-config        print the builtin default config to "
@@ -301,7 +300,13 @@ inline void reset_optind() {
 #endif
 }
 
+void clean_up(void);     // defined in conky.cc
+void handle_terminate(); // defined in conky.cc
+
 int main(int argc, char **argv) {
+  conky::log::init_logger();
+  std::set_terminate(&handle_terminate);
+
 #ifdef BUILD_I18N
   setlocale(LC_ALL, "");
   bindtextdomain(PACKAGE_NAME, LOCALE_DIR);
@@ -319,9 +324,7 @@ int main(int argc, char **argv) {
   struct curl_global_initializer {
     curl_global_initializer() {
       if (curl_global_init(CURL_GLOBAL_ALL)) {
-        NORM_ERR(
-            "curl_global_init() failed, you may not be able to use curl "
-            "variables");
+        LOG_WARNING("failed to initialize curl, curl variables may not work");
       }
     }
     ~curl_global_initializer() { curl_global_cleanup(); }
@@ -332,9 +335,10 @@ int main(int argc, char **argv) {
   /* handle command line parameters that don't change configs */
 #ifdef BUILD_X11
   if (!setlocale(LC_CTYPE, "")) {
-    NORM_ERR("Can't set the specified locale!\nCheck LANG, LC_CTYPE, LC_ALL.");
+    LOG_WARNING("can't set the specified locale, check LANG, LC_CTYPE, LC_ALL");
   }
 #endif /* BUILD_X11 */
+  opterr = 0;
   while (1) {
     int c = getopt_long(argc, argv, getopt_string, longopts, nullptr);
 
@@ -342,7 +346,10 @@ int main(int argc, char **argv) {
 
     switch (c) {
       case 'D':
-        global_debug_level++;
+        conky::log::log_more();
+        break;
+      case 'L':
+        conky::log::log_less();
         break;
       case 'v':
         print_version();
@@ -354,8 +361,9 @@ int main(int argc, char **argv) {
         current_config = optarg;
         break;
       case 'q':
+        conky::log::set_quiet();
         if (freopen("/dev/null", "w", stderr) == nullptr) {
-          CRIT_ERR("could not open /dev/null as stderr!");
+          SYSTEM_ERR("could not open /dev/null as stderr");
         }
         break;
       case 'h':
@@ -378,6 +386,11 @@ int main(int argc, char **argv) {
         break;
 #endif /* Linux || FreeBSD || Haiku || NetBSD || OpenBSD */
       case '?':
+        if (optopt != 0) {
+          LOG_ERROR("unknown option: '-{}'; try --help", static_cast<char>(optopt));
+        } else {
+          LOG_ERROR("unknown option: '{}'; try --help", argv[optind - 1]);
+        }
         return EXIT_FAILURE;
     }
   }
@@ -385,7 +398,7 @@ int main(int argc, char **argv) {
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || \
     defined(__HAIKU__) || defined(__NetBSD__) || defined(__OpenBSD__)
   if (unique_process && is_conky_already_running()) {
-    NORM_ERR("already running");
+    LOG_INFO("another conky instance is already running");
     return 0;
   }
 #endif /* Linux || FreeBSD || Haiku || NetBSD || OpenBSD */
@@ -404,14 +417,6 @@ int main(int argc, char **argv) {
     first_pass = 0; /* don't ever call fork() again */
 
     main_loop();
-  } catch (fork_throw &e) {
-    return EXIT_SUCCESS;
-  } catch (unknown_arg_throw &e) {
-    return EXIT_FAILURE;
-  } catch (obj_create_error &e) {
-    std::cerr << e.what() << std::endl;
-    clean_up();
-    return EXIT_FAILURE;
   } catch (std::exception &e) {
     std::cerr << PACKAGE_NAME ": " << e.what() << std::endl;
     return EXIT_FAILURE;

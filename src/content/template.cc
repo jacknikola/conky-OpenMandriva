@@ -77,8 +77,9 @@ static char *backslash_escape(const char *src, char **templates,
             break;
           }
           if (tmpl_num == 0) {
-            CRIT_ERR_FREE(
-                nullptr, nullptr,
+            free(nullptr);
+            free(nullptr);
+            USER_ERR(
                 "invalid template argument \\0; arguments must start at \\1");
           }
           dup_len += strlen(templates[tmpl_num - 1]);
@@ -146,14 +147,14 @@ static char *handle_template(const char *tmpl, const char *args) {
     for (i = 0; i < argcnt; i++) {
       char *tmp;
       tmp = backslash_escape(argsp[i], nullptr, 0);
-      DBGP2("%s: substituted arg '%s' to '%s'", tmpl, argsp[i], tmp);
+      LOG_TRACE("{}: substituted arg '{}' to '{}'", tmpl, argsp[i], tmp);
       argsp[i] = tmp;
     }
   }
 
   eval_text = backslash_escape(_template[template_idx].get(*state).c_str(),
                                argsp, argcnt);
-  DBGP("substituted %s, output is '%s'", tmpl, eval_text);
+  LOG_DEBUG("substituted {}, output is '{}'", tmpl, eval_text);
   free(args_dup);
   for (i = 0; i < argcnt; i++) { free(argsp[i]); }
   free(argsp);
@@ -210,7 +211,7 @@ char *find_and_replace_templates(const char *inbuf) {
         *(p - 1) = '\0';
       } else {
         // we ran into the end of string without finding a closing }, bark
-        CRIT_ERR("cannot find a closing '}' in template expansion");
+        USER_ERR("cannot find a closing '}}' in template expansion");
       }
     } else {
       templ = p + 1;
@@ -230,7 +231,7 @@ char *find_and_replace_templates(const char *inbuf) {
       free(tmpl_out);
       o = outbuf + strlen(outbuf);
     } else {
-      NORM_ERR("failed to handle template '%s' with args '%s'", templ, args);
+      LOG_ERROR("failed to handle template '{}' with args '{}'", templ, args ? args : "(none)");
     }
   }
   *o = '\0';

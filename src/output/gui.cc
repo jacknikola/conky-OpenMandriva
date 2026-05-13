@@ -44,7 +44,6 @@
 // #include "../conky-imlib2.h"
 // #endif /* BUILD_IMLIB2 */
 #ifndef OWN_WINDOW
-#include <iostream>
 #endif
 
 /* workarea where window / text is aligned (from _NET_WORKAREA on X11) */
@@ -80,8 +79,7 @@ void own_window_setting::lua_setter(lua::state &l, bool init) {
   if (init) {
     if (do_convert(l, -1).first) {
 #ifndef OWN_WINDOW
-      std::cerr << "Support for the own_window setting has been "
-                   "disabled during compilation\n";
+      LOG_WARNING("own_window support disabled at compile time, ignoring setting");
       l.pop();
       l.pushboolean(false);
 #endif
@@ -224,16 +222,30 @@ conky::simple_config_setting<uint16_t, window_hints_traits> own_window_hints(
 
 #if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 priv::colour_setting background_colour("own_window_colour", 0);
-conky::simple_config_setting<bool> set_transparent("own_window_transparent",
-                                                   false, false);
+conky::simple_config_setting<bool> set_transparent = conky::deprecated(
+    conky::simple_config_setting<bool>("own_window_transparent", false, false),
+    "Use own_window_colour with alpha instead (e.g. '#00000000').");
+
+conky::range_config_setting<int> own_window_argb_value = conky::deprecated(
+    conky::range_config_setting<int>("own_window_argb_value", 0, 255, 255,
+                                     false),
+    "Use own_window_colour with alpha instead (e.g. '#80000000').");
+
+Colour get_background_colour_preference(lua::state &l) {
+  // TODO: anything other than background_colour is deprecated.
+  // Simplify this dance in 5 years and remove other options completely.
+  Colour background = background_colour.get(l);
+  if (own_window_argb_value.get(l) < 0xff) {
+    background.alpha = own_window_argb_value.get(l);
+  }
+  if (set_transparent.get(l)) {
+    background.alpha = 0;
+  }
+
+  return background;
+}
 #endif /* OWN_WINDOW || BUILD_WAYLAND */
 
-#if defined(BUILD_ARGB) || defined(BUILD_WAYLAND)
-conky::simple_config_setting<bool> use_argb_visual("own_window_argb_visual",
-                                                   false, false);
-conky::range_config_setting<int> own_window_argb_value("own_window_argb_value",
-                                                       0, 255, 255, false);
-#endif /* BUILD_ARGB || BUILD_WAYLAND */
 priv::own_window_setting own_window;
 
 /******************** </SETTINGS> ************************/

@@ -28,6 +28,7 @@
  */
 
 #include "exec.h"
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -35,6 +36,7 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <string>
 #include "../conky.h"
 #include "../core.h"
 #include "../logging.h"
@@ -42,10 +44,11 @@
 #include "../content/text_object.h"
 #include "../update-cb.hh"
 
-struct execi_data {
+struct exec_data {
   float interval{0};
   char *cmd{nullptr};
-  execi_data() = default;
+  size_t last_execp_hash{0};
+  exec_data() = default;
 };
 
 static const int cmd_len = 256;
@@ -119,7 +122,7 @@ static FILE *pid_popen(const char *command, const char *mode, pid_t *child) {
     close(parentend);
 
     // by dupping childend, the returned fd will have close-on-exec turned off
-    if (fcntl(childend, F_DUPFD, 0) == -1) { perror("fcntl()"); }
+    if (fcntl(childend, F_DUPFD, 0) == -1) { LOG_ERROR("failed to dup child fd: {}", strerror(errno)); }
     close(childend);
 
     execl("/bin/sh", "sh", "-c", remove_excess_quotes(command),
@@ -198,15 +201,15 @@ static inline double get_barnum(const char *buf) {
   double barnum;
 
   if (sscanf(buf, "%lf", &barnum) != 1) {
-    NORM_ERR(
+    LOG_ERROR(
         "reading exec value failed (perhaps it's not the "
         "correct format?)");
     return 0.0;
   }
   if (barnum > 100.0 || barnum < 0.0) {
-    NORM_ERR(
-        "your exec value is not between 0 and 100, "
-        "therefore it will be ignored");
+    LOG_WARNING(
+        "exec value is not between 0 and 100, "
+        "it will be ignored");
     return 0.0;
   }
 
@@ -225,7 +228,25 @@ static inline double get_barnum(const char *buf) {
 void fill_p(const char *buffer, struct text_object *obj, char *p,
             unsigned int p_max_size) {
   if (obj->parse) {
-    evaluate(buffer, p, p_max_size);
+    size_t current_hash = std::hash<std::string>{}(buffer);
+
+    auto *ed = static_cast<struct exec_data *>(obj->data.opaque);
+
+    if (ed->last_execp_hash == 0 || current_hash != ed->last_execp_hash) {
+      if (obj->sub) {
+        free_text_objects(obj->sub);
+        free(obj->sub);
+      }
+
+      obj->sub =
+          static_cast<struct text_object *>(malloc(sizeof(struct text_object)));
+      if (obj->sub) { memset(obj->sub, 0, sizeof(struct text_object)); }
+      if (obj->sub) { extract_variable_text_internal(obj->sub, buffer); }
+
+      ed->last_execp_hash = current_hash;
+    }
+
+    if (obj->sub) { generate_text_internal(p, p_max_size, *obj->sub); }
   } else {
     snprintf(p, p_max_size, "%s", buffer);
   }
@@ -243,20 +264,18 @@ void fill_p(const char *buffer, struct text_object *obj, char *p,
  * @param[in] execflag bitwise flag used to specify the exec variant we need to
  * process
  */
-void scan_exec_arg(struct text_object *obj, const char *arg,
-                   unsigned int execflag) {
+void scan_exec_arg(struct text_object *obj, const char *arg, exec_flag flags) {
   const char *cmd = arg;
   char *orig_cmd = nullptr;
-  struct execi_data *ed;
+  auto ed = new exec_data;
 
   /* in case we have an execi object, we need to parse out the interval */
-  if ((execflag & EF_EXECI) != 0u) {
-    ed = new execi_data;
+  if (flags & exec_flag::interval) {
     int n;
 
     /* store the interval in ed->interval */
     if (sscanf(arg, "%f %n", &ed->interval, &n) <= 0) {
-      NORM_ERR("missing execi interval: ${execi* <interval> command}");
+      LOG_ERROR("missing execi interval: ${{execi* <interval> command}}");
       delete ed;
       ed = nullptr;
       return;
@@ -268,57 +287,40 @@ void scan_exec_arg(struct text_object *obj, const char *arg,
   }
 
   /* parse any special options for the graphical exec types */
-  if ((execflag & EF_BAR) != 0u) {
+  if (flags & exec_flag::bar) {
     cmd = scan_bar(obj, cmd, 100);
 #ifdef BUILD_GUI
-  } else if ((execflag & EF_GAUGE) != 0u) {
+  } else if (flags & exec_flag::gauge) {
     cmd = scan_gauge(obj, cmd, 100);
-  } else if ((execflag & EF_GRAPH) != 0u) {
+  } else if (flags & exec_flag::graph) {
     auto [buf, skip] = scan_command(cmd);
-    scan_graph(obj, cmd + skip, 100, FALSE);
+    scan_graph(obj, cmd + skip, 100, FALSE,
+               buf != nullptr ? graph_data_key{fmt::format("exec:{}", buf)}
+                              : graph_parent_obj_key);
     cmd = buf;
     if (cmd == nullptr) {
-      NORM_ERR("error parsing arguments to execgraph object");
+      LOG_ERROR("error parsing execgraph arguments: '{}'", arg ? arg : "(null)");
     }
 #endif /* BUILD_GUI */
   }
 
-  /* finally, store the resulting command, or an empty string if something went
-   * wrong */
-  if ((execflag & EF_EXEC) != 0u) {
-    obj->data.s =
-        strndup(cmd != nullptr ? cmd : "", text_buffer_size.get(*state));
-  } else if ((execflag & EF_EXECI) != 0u) {
-    ed->cmd = strndup(cmd != nullptr ? cmd : "", text_buffer_size.get(*state));
-    obj->data.opaque = ed;
-  }
+  /* store the resulting command, or an empty string if something went wrong */
+  ed->cmd = strndup(cmd != nullptr ? cmd : "", text_buffer_size.get(*state));
+  obj->data.opaque = ed;
   free_and_zero(orig_cmd);
-}
-
-/**
- * Register an exec_cb object using the command that we have parsed
- *
- * @param[out] obj stores the callback handle
- */
-void register_exec(struct text_object *obj) {
-  if ((obj->data.s != nullptr) && (obj->data.s[0] != 0)) {
-    obj->exec_handle = new conky::callback_handle<exec_cb>(
-        conky::register_cb<exec_cb>(1, true, obj->data.s));
-  } else {
-    DBGP("unable to register exec callback");
-  }
 }
 
 /**
  * Register an exec_cb object using the command that we have parsed.
  *
- * This version takes care of execi intervals. Note that we depend on
- * obj->thread, so be sure to run this function *after* setting obj->thread.
+ * For non-interval variants, ed->interval is 0 which yields period=1.
+ * Note that we depend on obj->thread, so be sure to run this function
+ * *after* setting obj->thread.
  *
  * @param[out] obj stores the callback handle
  */
-void register_execi(struct text_object *obj) {
-  auto *ed = static_cast<struct execi_data *>(obj->data.opaque);
+void register_exec(struct text_object *obj) {
+  auto *ed = static_cast<struct exec_data *>(obj->data.opaque);
 
   if ((ed != nullptr) && (ed->cmd != nullptr) && (ed->cmd[0] != 0)) {
     uint32_t period =
@@ -326,7 +328,7 @@ void register_execi(struct text_object *obj) {
     obj->exec_handle = new conky::callback_handle<exec_cb>(
         conky::register_cb<exec_cb>(period, !obj->thread, ed->cmd));
   } else {
-    DBGP("unable to register execi callback");
+    LOG_DEBUG("unable to register execi callback");
   }
 }
 
@@ -362,18 +364,7 @@ double execbarval(struct text_object *obj) {
  * @param[in] obj holds the data that we need to free up
  */
 void free_exec(struct text_object *obj) {
-  free_and_zero(obj->data.s);
-  delete obj->exec_handle;
-  obj->exec_handle = nullptr;
-}
-
-/**
- * Free up any dynamically allocated data, specifically for execi objects
- *
- * @param[in] obj holds the data that we need to free up
- */
-void free_execi(struct text_object *obj) {
-  auto *ed = static_cast<struct execi_data *>(obj->data.opaque);
+  auto *ed = static_cast<struct exec_data *>(obj->data.opaque);
 
   /* if ed is nullptr, there is nothing to do */
   if (ed == nullptr) { return; }

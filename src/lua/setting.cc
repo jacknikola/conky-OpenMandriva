@@ -45,6 +45,12 @@ using settings_vector = std::vector<priv::config_setting_base *>;
  */
 settings_map *settings;
 
+/// Settings that have been removed. Maps old name to an explanation message.
+const std::unordered_map<std::string, std::string> removed_settings = {
+    {"own_window_argb_visual", "ARGB is now always enabled when available. Control opacity with `own_window_colour` (e.g. '#8000')."},
+    {"store_graph_data_explicitly", "Graph data is now always stored directly in the node; this setting has no effect."},
+};
+
 /*
  * Returns the setting record corresponding to the value at the specified index.
  * If the value is not valid, returns nullptr and prints an error.
@@ -52,14 +58,20 @@ settings_map *settings;
 priv::config_setting_base *get_setting(lua::state &l, int index) {
   lua::Type type = l.type(index);
   if (type != lua::TSTRING) {
-    NORM_ERR("invalid setting of type '%s'", l.type_name(type));
+    LOG_ERROR("invalid setting of type '{}'", l.type_name(type));
     return nullptr;
   }
 
   const std::string &name = l.tostring(index);
   auto iter = settings->find(name);
   if (iter == settings->end()) {
-    NORM_ERR("Unknown setting '%s'", name.c_str());
+    auto removed = removed_settings.find(name);
+    if (removed != removed_settings.end()) {
+      LOG_WARNING("setting '{}' has been removed: {}", name,
+               removed->second);
+    } else {
+      LOG_ERROR("unknown setting '{}'", name);
+    }
     return nullptr;
   }
 
@@ -104,8 +116,6 @@ const std::vector<std::string> settings_ordering{
     "own_window_title",
     "own_window_type",
     "own_window_hints",
-    "own_window_argb_value",
-    "own_window_argb_visual",
     "own_window_colour",
     "own_window",
     "double_buffer",
@@ -164,9 +174,15 @@ config_setting_base::config_setting_base(std::string name_)
     : name(std::move(name_)), seq_no(get_next_seq_no()) {
   bool inserted = settings->insert({name, this}).second;
   if (!inserted) {
-    throw std::logic_error("Setting with name '" + name +
-                           "' already registered");
+    CRIT_ERR("setting '{}' already registered", name);
   }
+}
+
+config_setting_base::config_setting_base(config_setting_base &&other) noexcept
+    : name(std::move(other.name)),
+      seq_no(other.seq_no),
+      deprecation_msg(std::move(other.deprecation_msg)) {
+  (*settings)[name] = this;
 }
 
 void config_setting_base::lua_set(lua::state &l) {
@@ -193,6 +209,11 @@ void config_setting_base::process_setting(lua::state &l, bool init) {
 
   config_setting_base *ptr = get_setting(l, -3);
   if (ptr == nullptr) { return; }
+
+  if (init && ptr->deprecation_msg.has_value() && !l.isnil(-2)) {
+    LOG_WARNING("'{}' is deprecated and will be removed in a future "
+             "release: {}", ptr->name, *ptr->deprecation_msg);
+  }
 
   ptr->lua_setter(l, init);
   l.pushvalue(-2);
@@ -259,13 +280,13 @@ void set_config_settings(lua::state &l) {
   l.getglobal("conky");
   {
     if (l.type(-1) != lua::TTABLE) {
-      throw std::runtime_error("conky must be a table");
+      USER_ERR("'conky' must be a table in config");
     }
 
     l.rawgetfield(-1, "config");
     {
       if (l.type(-1) != lua::TTABLE) {
-        throw std::runtime_error("conky.config must be a table");
+        USER_ERR("'conky.config' must be a table in config");
       }
 
       priv::config_setting_base::make_conky_config(l);

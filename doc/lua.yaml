@@ -11,22 +11,21 @@
 #  * `default`: an optional default value, if applicable
 ---
 desc: |-
-  Conky features a Lua Programming API, and also ships with Lua bindings
-  for some useful libraries. Note that the bindings require tolua++, which
-  currently only compiles against Lua 5.1.
+  Conky features a Lua programming API and also ships with Lua bindings
+  for some useful libraries. Note that the bindings require tolua++.
 
-  To use Lua Conky, you first need to make sure you have a version of
+  To use Lua with Conky, first make sure you have a version of
   Conky with Lua support enabled (`conky -v` will report this).
-  Conky defines certain global functions and variables which can be
-  accessed from Lua code running in Conky. Scripts must first be loaded
-  using the lua_load configuration option. You then call functions in Lua
-  via Conky's $lua, $lua_read, and Lua hooks.
+  Conky defines certain global functions and variables that can be
+  accessed from Lua code running inside Conky. Scripts must first be loaded
+  using the `lua_load` configuration option. You can then call Lua functions
+  through Conky's `$lua`, `$lua_read`, and Lua hooks.
 
-  Be careful when creating threaded objects through the Lua API. You could
-  wind up with a whole bunch of threads running if a thread is created
+  Be careful when creating threaded objects through the Lua API. You could end
+  up with a large number of threads running if a thread is created
   with each iteration.
 
-  NOTE: In order to accommodate certain features in the cairo library's
+  Note: to accommodate certain features in the Cairo library's
   API, Conky will export a few additional functions for the creation of
   certain structures. These are documented below.
 values:
@@ -141,12 +140,11 @@ values:
       `tolua.takeownership(cte)`
   - name: conky_build_arch
     desc: |-
-      A string containing the build architecture for this
-      particular instance of Conky.
+      A string containing the build architecture for this Conky instance.
   - name: conky_build_info
     desc: |-
-      A string containing the build info for this particular
-      instance of Conky, including the version, build date, and
+      A string containing build information for this Conky instance, including
+      the version, build date, and
       architecture.
   - name: conky_config
     desc: |-
@@ -169,22 +167,46 @@ values:
     desc: |-
       Sets Conky's update interval (in seconds) to
       'number'.
+  - name: conky_surface()
+    desc: |-
+      Returns the current `cairo_surface_t` for the active display output,
+      or `nil` if no graphical surface is available. This is the preferred,
+      backend-agnostic way to obtain a drawing surface for use with Cairo.
+
+      The returned surface is only valid for the current draw cycle. Do not
+      cache it across frames; call `conky_surface()` each time your draw
+      hook is invoked.
+
+      Example usage:
+
+      ```lua
+      require('cairo')
+      function conky_draw()
+        local surface = conky_surface()
+        if not surface then return end
+        local cr = cairo_create(surface)
+        -- draw ...
+        cairo_destroy(cr)
+      end
+      ```
   - name: conky_version
     desc: |-
-      A string containing the version of the current instance of
-      Conky.
+      A string containing the version of the current Conky instance.
   - name: conky_window
     desc: |-
-      This table contains some information about Conky's window.
+      This table contains read-only information about Conky's window.
       The following table describes the values contained:
 
       | Key                 | Value                                                                           |
       |---------------------|---------------------------------------------------------------------------------|
-      | drawable            | Window's drawable (Xlib Drawable), requires Lua extras enabled at compile time. |
-      | visual              | Window's visual (Xlib Visual), requires Lua extras enabled at compile time.     |
-      | display             | Window's display (Xlib Display), requires Lua extras enabled at compile time.   |
-      | width               | Window width (in pixels).                                                       |
-      | height              | Window height (in pixels).                                                      |
+      | drawable            | **Deprecated.** Window's drawable (Xlib Drawable). Use `conky_surface()` instead.|
+      | visual              | **Deprecated.** Window's visual (Xlib Visual). Use `conky_surface()` instead.   |
+      | display             | **Deprecated.** Window's display (Xlib Display). Use `conky_surface()` instead. |
+      | width               | Window width in layout points (pt; logical).                                    |
+      | height              | Window height in layout points (pt; logical).                                   |
+      | pixel_size.x        | Window width in device pixels (px; physical).                                   |
+      | pixel_size.y        | Window height in device pixels (px; physical).                                  |
+      | scale               | Scaling factor of the buffer (dpi; pixel_size / size).                          |
       | border_inner_margin | Window's inner border margin (in pixels).                                       |
       | border_outer_margin | Window's outer border margin (in pixels).                                       |
       | border_width        | Window's border width (in pixels).                                              |
@@ -193,8 +215,9 @@ values:
       | text_width          | The width of the text drawing region.                                           |
       | text_height         | The height of the text drawing region.                                          |
 
-      NOTE: This table is only defined when X support is
-      enabled.
+      NOTE: This table is only defined when a GUI output is
+      active. The `drawable`, `visual`, and `display` fields are
+      X11-specific and deprecated.
   - name: ret_scale_x,ret_scale_y:cairo_draw_image(file, cs, x, y, scale_x, scale_y)
     desc: |-
       Renders an image onto a cairo_surface_t, using imlib2. Returns the amount the image was scaled by
@@ -205,7 +228,41 @@ values:
       | cs                  | The `cairo_surface_t` to render to.                                                  |
       | x,y                 | Position to render the image.                                                        |
       | scale_x, scale_y    | The amount to scale the image, 1.0 provides no scaling, 2.0 for twice the size and   |
-      |                     | 0.5 for half size etc.                                                               |
-      |                     | Default value: No Scaling (1.0,1.0)                                                  |
+      |                     | 0.5 for half size etc. <br/>Default value: No Scaling (1.0,1.0)                      |
 
       require('cairo_imlib2_helper') in your lua file.
+
+  - name: cairo_text_hp_show(cr, x, y, text, font, font_size, alignment, language, script, direction)
+    desc: |-
+      Renders text to a `cairo_t` using HarfBuzz and FreeType. This provides
+      significantly better text rendering than Cairo's built-in functions.
+
+      | Argument            | Description                                                                          |
+      |---------------------|--------------------------------------------------------------------------------------|
+      | cr                  | The `cairo_t` to render to.                                                          |
+      | x,y                 | Position to render the text.                                                         |
+      | text                | The text to render.                                                                  |
+      | font                | The name of the font to be used, `Fontconfig` is used to search for the font.        |
+      | font_size           | The font size.                                                                       |
+      | alignment           | One of `CAIRO_TEXT_ALIGN_LEFT`, `CAIRO_TEXT_ALIGN_RIGHT`, `CAIRO_TEXT_ALIGN_CENTER`.<br/>Default value: `CAIRO_TEXT_ALIGN_LEFT` |
+      | language            | A string containing a BCP 47 language tag.<br/>Default value: `en`                   |
+      | script              | A string containing a ISO 15924 script tag.<br/>Default value: auto-detect from text |
+      | direction           | A string representing text direction eg `LTR`, `RTL` or `TTB`<br/>Default value: auto-detect from text otherwise `LTR` |
+  - name: width,height:cairo_text_hp_text_size(text, font, font_size, language, script, direction)
+    desc: |-
+      Used to calculate how many pixels will be required to render a string with
+      `cairo_text_hp_show` returns a pair of int's with `width` and `height`.
+
+      | Argument            | Description                                                                          |
+      |---------------------|--------------------------------------------------------------------------------------|
+      | cr                  | The `cairo_t` to render to.                                                          |
+      | text                | The text to render.                                                                  |
+      | font                | The name of the font to be used, `Fontconfig` is used to search for the font.        |
+      | font_size           | The font size.                                                                       |
+      | language            | A string containing a BCP 47 language tag.<br/>Default value: `en`                   |
+      | script              | A string containing a ISO 15924 script tag.<br/>Default value: auto-detect from text |
+      | direction           | A string representing text direction eg `LTR`, `RTL` or `TTB`<br/> Default value: auto-detect from text otherwise `LTR` |
+  - name: cairo_text_hp_delete_fonts()
+    desc: |-
+      `cairo_text_hp_show` and `cairo_text_hp_text_size` both cache internal font details,
+      this function clears those caches.

@@ -30,95 +30,197 @@
 #ifndef _LOGGING_H
 #define _LOGGING_H
 
-#include <cinttypes>  // correct formatting for int types
-#include <cstdio>
 #include <stdexcept>
 #include "config.h"
 #include "i18n.h"
 
-class fork_throw : public std::runtime_error {
- public:
-  fork_throw() : std::runtime_error("Fork happened") {}
-  fork_throw(const std::string &msg) : std::runtime_error(msg) {}
+#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
+#include <spdlog/spdlog.h>
+#include <spdlog/fmt/fmt.h>
+#include <filesystem>
+
+template <>
+struct fmt::formatter<std::filesystem::path> : fmt::formatter<std::string> {
+  auto format(const std::filesystem::path &p, fmt::format_context &ctx) const {
+    return fmt::formatter<std::string>::format(p.string(), ctx);
+  }
 };
-
-class unknown_arg_throw : public std::runtime_error {
- public:
-  unknown_arg_throw() : std::runtime_error("Unknown argumunt given") {}
-  unknown_arg_throw(const std::string &msg) : std::runtime_error(msg) {}
-};
-
-class combine_needs_2_args_error : public std::runtime_error {
- public:
-  combine_needs_2_args_error()
-      : std::runtime_error("combine needs arguments: <text1> <text2>") {}
-  combine_needs_2_args_error(const std::string &msg)
-      : std::runtime_error(msg) {}
-};
-
-class obj_create_error : public std::runtime_error {
- public:
-  obj_create_error() : std::runtime_error("Failed to create object") {}
-  obj_create_error(const std::string &msg) : std::runtime_error(msg) {}
-};
-
-void clean_up(void);
-
-template <typename... Args>
-inline void gettextize_format(const char *format, Args &&...args) {
-  fprintf(stderr, _(format), args...);
-}
-
-// explicit specialization for no arguments to avoid the
-// "format not a string literal and no format arguments" warning
-inline void gettextize_format(const char *format) { fputs(_(format), stderr); }
-
-template <typename... Args>
-void NORM_ERR(const char *format, Args &&...args) {
-  fprintf(stderr, PACKAGE_NAME ": ");
-  gettextize_format(format, args...);
-  fputs("\n", stderr);
-}
-
-/* critical error with additional cleanup */
-template <typename... Args>
-__attribute__((noreturn)) inline void CRIT_ERR_FREE(void *memtofree1,
-                                                    void *memtofree2,
-                                                    const char *format,
-                                                    Args &&...args) {
-  NORM_ERR(format, args...);
-  free(memtofree1);
-  free(memtofree2);
-  clean_up();
-  exit(EXIT_FAILURE);
-}
-
-/* critical error */
-template <typename... Args>
-__attribute__((noreturn)) inline void CRIT_ERR(const char *format,
-                                               Args &&...args) {
-  CRIT_ERR_FREE(nullptr, nullptr, format, args...);
-}
 
 namespace conky {
+
 class error : public std::runtime_error {
  public:
   error(const std::string &msg) : std::runtime_error(msg) {}
 };
+
+struct bad_command_arguments_error : public std::runtime_error {
+  std::string command;
+
+  bad_command_arguments_error(const char *command, const std::string &msg)
+      : std::runtime_error(msg), command(command) {}
+};
 }  // namespace conky
 
-/* debugging output */
-extern int global_debug_level;
+namespace conky::log {
+void init_logger();
+void log_more();
+void log_less();
+void set_quiet();
 
-#define __DBGP(level, ...)                                               \
-  do {                                                                   \
-    if (global_debug_level > level) {                                    \
-      fprintf(stderr, "DEBUG(%d) [" __FILE__ ":%d]: ", level, __LINE__); \
-      gettextize_format(__VA_ARGS__);                                    \
-      fputs("\n", stderr);                                               \
-    }                                                                    \
+struct attribute {
+  std::string key;
+  std::string value;
+
+  template <typename T,
+            typename = std::enable_if_t<fmt::is_formattable<T>::value>>
+  attribute(std::string_view k, const T &v)
+      : key(k), value(fmt::format("{}", v)) {}
+};
+
+using attribute_list = std::vector<attribute>;
+
+class span {
+  std::string m_name;
+
+ public:
+  explicit span(std::string name) : m_name(std::move(name)) {}
+
+  const std::string &name() const { return m_name; }
+};
+
+class span_guard {
+  bool m_active = false;
+
+ public:
+  span_guard() = default;
+  span_guard(span_guard &&other) noexcept : m_active(other.m_active) {
+    other.m_active = false;
+  }
+  span_guard(const span_guard &) = delete;
+  span_guard &operator=(const span_guard &) = delete;
+  span_guard &operator=(span_guard &&) = delete;
+  ~span_guard();
+
+  /// Activate this span guard, pushing a span onto the thread-local stack.
+  void open(spdlog::source_loc loc, std::string name,
+            std::initializer_list<attribute> attrs = {});
+
+  /// Explicitly end this span before scope exit.
+  void drop();
+};
+
+/// Returns the current span context formatted for log output.
+std::string current_span_context();
+
+/// Captures the current thread's span stack for cross-thread propagation.
+std::vector<span> capture_context();
+
+/// Installs a captured span stack into the current thread.
+void install_context(const std::vector<span> &ctx);
+
+/// Push per-message attributes (accumulated, cleared after log call).
+void push_msg_attrs(std::initializer_list<attribute> attrs);
+/// Clear all accumulated per-message attributes
+void clear_msg_attrs();
+
+}  // namespace conky::log
+
+#define LOG_SCOPE(name, ...)                                            \
+  ([&]() -> conky::log::span_guard {                                    \
+    conky::log::span_guard _guard;                                      \
+    if (spdlog::default_logger()->should_log(spdlog::level::debug))     \
+      _guard.open(                                                      \
+          spdlog::source_loc{__FILE__, __LINE__, __func__},             \
+          name, ##__VA_ARGS__);                                         \
+    return _guard;                                                      \
+  }())
+
+// syslog.h defines LOG_DEBUG, LOG_INFO, LOG_WARNING etc. as integers
+#undef LOG_TRACE
+#undef LOG_DEBUG
+#undef LOG_INFO
+#undef LOG_WARNING
+#undef LOG_ERROR
+#undef LOG_CRITICAL
+
+#define LOG_TRACE(...) SPDLOG_TRACE(__VA_ARGS__)
+#define LOG_DEBUG(...) SPDLOG_DEBUG(__VA_ARGS__)
+#define LOG_INFO(...) SPDLOG_INFO(__VA_ARGS__)
+#define LOG_WARNING(...) SPDLOG_WARN(__VA_ARGS__)
+#define LOG_ERROR(...) SPDLOG_ERROR(__VA_ARGS__)
+#define LOG_CRITICAL(...) SPDLOG_CRITICAL(__VA_ARGS__)
+
+#define _LOG_STRIP_PARENS(...) __VA_ARGS__
+#define _LOG_MESSAGE_LEVEL_WITH_ATTRIBUTES_IMPLEMENTATION(spdlog_macro, attrs, ...) \
+  do {                                                  \
+    if (spdlog::default_logger()->should_log(           \
+            spdlog::level::trace)) {                    \
+      conky::log::push_msg_attrs({_LOG_STRIP_PARENS attrs}); \
+      spdlog_macro(__VA_ARGS__);                        \
+      conky::log::clear_msg_attrs();                    \
+    } else {                                            \
+      spdlog_macro(__VA_ARGS__);                        \
+    }                                                   \
   } while (0)
-#define DBGP(...) __DBGP(0, __VA_ARGS__)
-#define DBGP2(...) __DBGP(1, __VA_ARGS__)
+
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_TRACE
+#define LOG_TRACE_WITH(attrs, ...) _LOG_MESSAGE_LEVEL_WITH_ATTRIBUTES_IMPLEMENTATION(SPDLOG_TRACE, attrs, __VA_ARGS__)
+#else
+#define LOG_TRACE_WITH(attrs, ...) ((void)0)
+#endif
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
+#define LOG_DEBUG_WITH(attrs, ...) _LOG_MESSAGE_LEVEL_WITH_ATTRIBUTES_IMPLEMENTATION(SPDLOG_DEBUG, attrs, __VA_ARGS__)
+#else
+#define LOG_DEBUG_WITH(attrs, ...) ((void)0)
+#endif
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_INFO
+#define LOG_INFO_WITH(attrs, ...) _LOG_MESSAGE_LEVEL_WITH_ATTRIBUTES_IMPLEMENTATION(SPDLOG_INFO, attrs, __VA_ARGS__)
+#else
+#define LOG_INFO_WITH(attrs, ...) ((void)0)
+#endif
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_WARN
+#define LOG_WARNING_WITH(attrs, ...) _LOG_MESSAGE_LEVEL_WITH_ATTRIBUTES_IMPLEMENTATION(SPDLOG_WARN, attrs, __VA_ARGS__)
+#else
+#define LOG_WARNING_WITH(attrs, ...) ((void)0)
+#endif
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_ERROR
+#define LOG_ERROR_WITH(attrs, ...) _LOG_MESSAGE_LEVEL_WITH_ATTRIBUTES_IMPLEMENTATION(SPDLOG_ERROR, attrs, __VA_ARGS__)
+#else
+#define LOG_ERROR_WITH(attrs, ...) ((void)0)
+#endif
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_CRITICAL
+#define LOG_CRITICAL_WITH(attrs, ...) _LOG_MESSAGE_LEVEL_WITH_ATTRIBUTES_IMPLEMENTATION(SPDLOG_CRITICAL, attrs, __VA_ARGS__)
+#else
+#define LOG_CRITICAL_WITH(attrs, ...) ((void)0)
+#endif
+
+/// Critical error (developer fault) - logs and terminates with core dump.
+#define CRIT_ERR(...)          \
+  do {                         \
+    LOG_CRITICAL(__VA_ARGS__); \
+    std::terminate();          \
+  } while (0)
+
+/// User error (bad input/config) - logs and throws.
+#define USER_ERR(...)                                    \
+  do {                                                   \
+    LOG_ERROR(__VA_ARGS__);                              \
+    throw conky::error(fmt::format(__VA_ARGS__));        \
+  } while (0)
+
+/// System error (missing feature/support) - logs and throws.
+#define SYSTEM_ERR(...)                                  \
+  do {                                                   \
+    LOG_ERROR(__VA_ARGS__);                              \
+    throw conky::error(fmt::format(__VA_ARGS__));        \
+  } while (0)
+
+/// Invalid command arguments - logs and throws.
+#define COMMAND_ARG_ERR(Command, ...)                                    \
+  do {                                                                   \
+    LOG_ERROR(__VA_ARGS__);                                              \
+    throw conky::bad_command_arguments_error(Command,                    \
+                                             fmt::format(__VA_ARGS__));  \
+  } while (0)
 
 #endif /* _LOGGING_H */

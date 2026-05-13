@@ -101,11 +101,11 @@ struct diskio_stat *prepare_diskio_stat(const char *s) {
     snprintf(&(stat_name[0]), text_buffer_size.get(*state), "/dev/%s",
              &(device_name[0]));
     if ((stat(&(stat_name[0]), &sb) != 0) || !S_ISBLK(sb.st_mode)) {
-      NORM_ERR("diskio device '%s' does not exist", &device_s[0]);
+      LOG_WARNING("diskio device '{}' does not exist", &device_s[0]);
     }
   } else if ((0 == (strncmp(s, "partuuid:", 9))) &&
              ((stat(rpbuf2, &sb) != 0) || !S_ISBLK(sb.st_mode))) {
-    NORM_ERR("diskio device '%s' does not exist", &device_s[0]);
+    LOG_WARNING("diskio device '{}' does not exist", &device_s[0]);
   }
 
 #endif
@@ -173,9 +173,12 @@ void print_diskio_write(struct text_object *obj, char *p,
 #ifdef BUILD_GUI
 void parse_diskiograph_arg(struct text_object *obj, const char *arg) {
   auto [buf, skip] = scan_command(arg);
-  scan_graph(obj, arg + skip, 0, FALSE);
+  const char *dev = dev_name(buf);
+  scan_graph(obj, arg + skip, 0, FALSE,
+             dev != nullptr ? graph_data_key{fmt::format("diskio:{}", dev)}
+                            : graph_parent_obj_key);
 
-  obj->data.opaque = prepare_diskio_stat(dev_name(buf));
+  obj->data.opaque = prepare_diskio_stat(dev);
   free_and_zero(buf);
 }
 

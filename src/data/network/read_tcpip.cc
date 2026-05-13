@@ -65,8 +65,7 @@ void parse_read_tcpip_arg(struct text_object *obj, const char *arg,
     strncpy(rtd->host, "localhost", 10);
   }
   if (rtd->port < 1 || rtd->port > 65535) {
-    CRIT_ERR_FREE(
-        obj, free_at_crash,
+    COMMAND_ARG_ERR("read_tcp/read_udp",
         "read_tcp and read_udp need a port from 1 to 65535 as argument");
   }
 
@@ -92,15 +91,14 @@ void parse_tcp_ping_arg(struct text_object *obj, const char *arg,
       break;
     default:  // this point should never be reached
       free(hostname);
-      CRIT_ERR_FREE(obj, free_at_crash, "tcp_ping: Reading arguments failed");
+      COMMAND_ARG_ERR("tcp_ping", "tcp_ping: failed to read arguments");
   }
   if ((he = gethostbyname(hostname)) == nullptr) {
-    NORM_ERR("tcp_ping: Problem with resolving '%s', using 'localhost' instead",
+    LOG_WARNING("tcp_ping: problem resolving '{}', using 'localhost' instead",
              hostname);
     if ((he = gethostbyname("localhost")) == nullptr) {
       free(hostname);
-      CRIT_ERR_FREE(obj, free_at_crash,
-                    "tcp_ping: Resolving 'localhost' also failed");
+      SYSTEM_ERR("tcp_ping: resolving 'localhost' also failed");
     }
   }
   if (he != nullptr) {
@@ -145,14 +143,14 @@ void print_tcp_ping(struct text_object *obj, char *p, unsigned int p_max_size) {
           snprintf(p, p_max_size, "%s", TCP_PING_FAILED);
         }
       } else {
-        NORM_ERR("tcp_ping: Couldn't wait on the 'pong'");
+        LOG_ERROR("tcp_ping: couldn't wait on the 'pong'");
       }
     } else {
-      NORM_ERR("tcp_ping: Couldn't start connection");
+      LOG_ERROR("tcp_ping: couldn't start connection");
     }
     close(sock);
   } else {
-    NORM_ERR("tcp_ping: Couldn't create socket");
+    LOG_ERROR("tcp_ping: couldn't create socket");
   }
 }
 
@@ -175,7 +173,7 @@ void print_read_tcpip(struct text_object *obj, char *p, int p_max_size,
   hints.ai_protocol = protocol;
   snprintf(portbuf, 8, "%u", rtd->port);
   if (getaddrinfo(rtd->host, portbuf, &hints, &airesult) != 0) {
-    NORM_ERR("%s: Problem with resolving the hostname",
+    LOG_ERROR("{}: problem resolving the hostname",
              protocol == IPPROTO_TCP ? "read_tcp" : "read_udp");
     return;
   }
@@ -189,9 +187,9 @@ void print_read_tcpip(struct text_object *obj, char *p, int p_max_size,
   freeaddrinfo(airesult);
   if (rp == nullptr) {
     if (protocol == IPPROTO_TCP) {
-      NORM_ERR("read_tcp: Couldn't create a connection");
+      LOG_ERROR("read_tcp: couldn't create a connection");
     } else {
-      NORM_ERR("read_udp: Couldn't listen");  // other error because udp is
+      LOG_ERROR("read_udp: couldn't listen");  // other error because udp is
                                               // connectionless
     }
     return;
@@ -200,7 +198,7 @@ void print_read_tcpip(struct text_object *obj, char *p, int p_max_size,
     // when using udp send a zero-length packet to let the other end know of our
     // existence
     if (write(sock, nullptr, 0) < 0) {
-      NORM_ERR("read_udp: Couldn't create a empty package");
+      LOG_ERROR("read_udp: couldn't create an empty package");
     }
   }
   FD_ZERO(&readfds);

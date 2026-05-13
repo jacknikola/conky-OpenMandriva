@@ -26,8 +26,8 @@
 #include <cmath>
 #include <mutex>
 #include "../../conky.h"
-#include "../../logging.h"
 #include "../../content/text_object.h"
+#include "../../logging.h"
 
 #ifdef DEBUG
 #include <assert.h>
@@ -77,7 +77,7 @@ size_t curl_internal::write_cb(void *ptr, size_t size, size_t nmemb,
 }
 
 curl_internal::curl_internal(const std::string &url) : curl(curl_easy_init()) {
-  if (!curl) throw std::runtime_error("curl_easy_init() failed");
+  if (!curl) { SYSTEM_ERR("failed to initialize curl session"); }
 
   curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1);
   curl_easy_setopt(curl, CURLOPT_HEADERDATA, this);
@@ -86,7 +86,19 @@ curl_internal::curl_internal(const std::string &url) : curl(curl_easy_init()) {
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "conky-curl/1.1");
+#ifdef CURLOPT_PROTOCOLS_STR
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+#elif defined(CURLOPT_PROTOCOLS)
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+  curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+#ifdef CURLOPT_REDIR_PROTOCOLS_STR
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#elif defined(CURLOPT_REDIR_PROTOCOLS)
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS,
+                   CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1000);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60);
 
@@ -132,15 +144,15 @@ void curl_internal::do_work() {
         case 304:
           break;
         default:
-          NORM_ERR("curl: no data from server, got HTTP status %ld",
+          LOG_ERROR("curl: no data from server, got HTTP status {}",
                    http_status_code);
           break;
       }
     } else {
-      NORM_ERR("curl: no HTTP status from server");
+      LOG_ERROR("curl: no HTTP status from server");
     }
   } else {
-    NORM_ERR("curl: could not retrieve data from server");
+    LOG_ERROR("curl request failed: {}", curl_easy_strerror(res));
   }
 }
 }  // namespace priv
@@ -185,7 +197,7 @@ void curl_parse_arg(struct text_object *obj, const char *arg) {
   char *space;
 
   if (strlen(arg) < 1) {
-    NORM_ERR("wrong number of arguments for $curl");
+    LOG_ERROR("wrong number of arguments for $curl, expected: url [interval_minutes]");
     return;
   }
 
@@ -212,7 +224,7 @@ void curl_print(struct text_object *obj, char *p, unsigned int p_max_size) {
   struct curl_data *cd = static_cast<struct curl_data *>(obj->data.opaque);
 
   if (!cd) {
-    NORM_ERR("error processing Curl data");
+    LOG_ERROR("error processing curl data");
     return;
   }
   ccurl_process_info(p, p_max_size, cd->uri, cd->interval);

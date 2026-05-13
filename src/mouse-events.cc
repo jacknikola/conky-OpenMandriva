@@ -27,9 +27,7 @@
 
 #include "logging.h"
 
-#ifdef BUILD_XINPUT
 #include <cstring>
-#endif
 
 extern "C" {
 #include <lua.h>
@@ -216,7 +214,7 @@ void mouse_button_event::push_lua_data(lua_State *L) const {
 }
 #endif /* BUILD_MOUSE_EVENTS */
 
-#ifdef BUILD_XINPUT
+#ifdef BUILD_X11
 /// Last global device id.
 size_t last_device_id = 0;
 
@@ -234,7 +232,7 @@ device_info *device_info::from_xi_id(xi_device_id device_id, Display *display) {
   if (num_devices == 0) return nullptr;
 
   int master;
-  
+
   if(device->use == XIMasterPointer){
     master = device->deviceid;
   }
@@ -298,9 +296,7 @@ size_t fixed_valuator_index(Display *display, XIDeviceInfo *device,
                       reinterpret_cast<unsigned char **>(&value)) == 0) {
       if (num_items == 0) break;
       if (type_return != XA_INTEGER) {
-        NORM_ERR(
-            "invalid '%s' option value, expected a single integer; value will "
-            "be ignored",
+        LOG_WARNING("invalid '{}' option value, expected a single integer; value will be ignored",
             atom_names[*valuator]);
         XFree(value);
         break;
@@ -313,11 +309,17 @@ size_t fixed_valuator_index(Display *display, XIDeviceInfo *device,
   return *valuator;
 }
 
-/// Allows override of valuator value type in `xorg.conf` in case they're wrong
-/// for some device (happens with VMs and some devices/setups).
+/// Allows override of valuator value type via X device properties in case
+/// they're wrong for some device (happens with VMs and some devices/setups).
+///
+/// Scroll valuators always accumulate regardless of XIValuatorClassInfo::mode,
+/// so they default to absolute.
+/// See: https://www.x.org/releases/X11R7.7/doc/inputproto/XI2proto.txt
+/// (section "XIScrollClass")
 bool fixed_valuator_relative(Display *display, XIDeviceInfo *device,
                              valuator_t valuator,
-                             XIValuatorClassInfo *class_info) {
+                             XIValuatorClassInfo *class_info,
+                             bool is_scroll) {
   const std::array<const char *, 2> atom_names = {
       "ConkyValuatorMoveMode",
       "ConkyValuatorScrollMode",
@@ -337,9 +339,7 @@ bool fixed_valuator_relative(Display *display, XIDeviceInfo *device,
                       reinterpret_cast<unsigned char **>(&value_return)) == 0) {
       if (num_items == 0) break;
       if (type_return != XA_ATOM) {
-        NORM_ERR(
-            "invalid '%s' option value, expected an atom (string); value will "
-            "be ignored",
+        LOG_WARNING("invalid '{}' option value, expected an atom (string); value will be ignored",
             atom_names[*valuator >> 1]);
         XFree(value_return);
         break;
@@ -355,11 +355,8 @@ bool fixed_valuator_relative(Display *display, XIDeviceInfo *device,
       if (strcmp(reinterpret_cast<char *>(value), "relative") == 0) {
         relative = true;
       } else if (strcmp(reinterpret_cast<char *>(value), "absolute") != 0) {
-        NORM_ERR(
-            "unknown '%s' option value: '%s', expected 'absolute' or "
-            "'relative'; "
-            "value will be ignored",
-            atom_names[*valuator >> 1]);
+        LOG_WARNING("unknown '{}' option value: '{}', expected 'absolute' or 'relative'; value will be ignored",
+            atom_names[*valuator >> 1], value);
         XFree(value);
         break;
       }
@@ -367,6 +364,12 @@ bool fixed_valuator_relative(Display *display, XIDeviceInfo *device,
       return relative;
     }
   } while (true);
+
+  // Scroll valuators accumulate; XIValuatorClassInfo::mode is unreliable
+  // for them (libinput reports XIModeRelative despite absolute values).
+  // This is because X11 was designed from ground up to make relative sense.
+  if (is_scroll) return false;
+
   return class_info->mode == XIModeRelative;
 }
 
@@ -389,6 +392,43 @@ void device_info::init_xi_device(
         fixed_valuator_index(display, device, static_cast<valuator_t>(i));
   }
 
+  // XIScrollClass is the authoritative source for scroll valuator mapping.
+  // Per the spec, each XIScrollClassInfo::number corresponds to an
+  // XIValuatorClassInfo with the same number. Don't guess from ordinals.
+  // Devices without XIScrollClass entries have no scroll valuators; scroll
+  // is handled via button 4-7 events instead.
+  std::map<size_t, double> scroll_increments;
+  // Invalidate ordinal defaults; keep user overrides from fixed_valuator_index.
+  for (auto sv : {valuator_t::SCROLL_X, valuator_t::SCROLL_Y}) {
+    if (valuator_indices[*sv] == *sv) { valuator_indices[*sv] = SIZE_MAX; }
+  }
+  for (int i = 0; i < device->num_classes; i++) {
+    if (device->classes[i]->type != XIScrollClass) continue;
+    auto *si = reinterpret_cast<XIScrollClassInfo *>(device->classes[i]);
+    scroll_increments[si->number] = si->increment;
+
+    valuator_t target = valuator_t::UNKNOWN;
+    if (si->scroll_type == XIScrollTypeVertical)
+      target = valuator_t::SCROLL_Y;
+    else if (si->scroll_type == XIScrollTypeHorizontal)
+      target = valuator_t::SCROLL_X;
+
+    LOG_DEBUG("xi scroll class: number={} type={} increment={}",
+              si->number,
+              si->scroll_type == XIScrollTypeVertical ? "vertical" : "horizontal",
+              si->increment);
+
+    // Only set if not already claimed and doesn't conflict with a move axis.
+    // Some devices (e.g. Xephyr) alias scroll and move to the same valuator;
+    // movement deltas would be misinterpreted as scroll.
+    if (target != valuator_t::UNKNOWN &&
+        valuator_indices[*target] == SIZE_MAX &&
+        si->number != valuator_indices[*valuator_t::MOVE_X] &&
+        si->number != valuator_indices[*valuator_t::MOVE_Y]) {
+      valuator_indices[*target] = si->number;
+    }
+  }
+
   // class order is undefined!
   for (int i = 0; i < device->num_classes; i++) {
     if (device->classes[i]->type != XIValuatorClass) continue;
@@ -404,17 +444,36 @@ void device_info::init_xi_device(
     }
     if (valuator == valuator_t::UNKNOWN) { continue; }
 
+    // Scroll valuators with XIScrollClassInfo always accumulate — scroll
+    // is derived from value deltas divided by increment.
+    // See: https://www.x.org/releases/X11R7.7/doc/inputproto/XI2proto.txt
+    // (section "XIScrollClass")
+    // Only consult fixed_valuator_relative for non-scroll axes.
+    auto it = scroll_increments.find(class_info->number);
+    bool is_scroll = it != scroll_increments.end();
+
     auto info = conky_valuator_info{
         .index = static_cast<size_t>(class_info->number),
         .min = class_info->min,
         .max = class_info->max,
         .value = class_info->value,
-        .relative =
-            fixed_valuator_relative(display, device, valuator, class_info),
+        .relative = fixed_valuator_relative(display, device, valuator,
+                                             class_info, is_scroll),
     };
+
+    if (is_scroll) { info.increment = it->second; }
 
     this->valuators[*valuator] = info;
   }
+
+  LOG_DEBUG("xi device '{}' valuators: move_x={} move_y={} scroll_x={} "
+            "scroll_y={} scroll_y_increment={}",
+            device->name,
+            this->valuators[*valuator_t::MOVE_X].index,
+            this->valuators[*valuator_t::MOVE_Y].index,
+            this->valuators[*valuator_t::SCROLL_X].index,
+            this->valuators[*valuator_t::SCROLL_Y].index,
+            this->valuators[*valuator_t::SCROLL_Y].increment);
 
   if (std::holds_alternative<xi_device_id>(source)) {
     XIFreeDeviceInfo(device);
@@ -479,11 +538,16 @@ xi_event_data *xi_event_data::read_cookie(Display *display, const void *data) {
     if (valuator_info.relative) {
       result->valuators_relative[v] = current;
     } else {
-      // XXX these doubles come from int values and might wrap around though
-      // it's hard to tell what int type is the source as it depends on the
-      // device/driver.
+      // Source int width is driver-dependent; wraparound is theoretically
+      // possible but unrealistic with 32-bit values.
       result->valuators_relative[v] = current - valuator_info.value;
     }
+    LOG_TRACE_WITH(({"index", valuator_info.index},
+                    {"current", current},
+                    {"prev", valuator_info.value},
+                    {"relative", valuator_info.relative}),
+                   "xi valuator[{}] delta={}", v,
+                   result->valuators_relative[v]);
     valuator_info.value = current;
   }
 
@@ -506,6 +570,8 @@ std::optional<double> xi_event_data::valuator_value(valuator_t valuator) const {
 
 std::optional<double> xi_event_data::valuator_relative_value(
     valuator_t valuator) const {
+  auto &info = this->device->valuator(valuator);
+  if (this->valuators.count(info.index) == 0) return std::nullopt;
   return this->valuators_relative.at(*valuator);
 }
 
@@ -542,44 +608,51 @@ std::vector<std::tuple<int, XEvent *>> xi_event_data::generate_events(
       result.emplace_back(std::make_tuple(PointerMotionMask, produced));
     }
     if (is_scroll) {
-      XEvent *produced = new XEvent;
-      std::memset(produced, 0, sizeof(XEvent));
-
-      uint scroll_direction = 4;
+      uint scroll_direction = 0;
       auto vertical = this->valuator_relative_value(valuator_t::SCROLL_Y);
       double vertical_value = vertical.value_or(0.0);
 
       if (vertical_value != 0.0) {
-        scroll_direction = vertical_value < 0.0 ? Button4 : Button5;
+        double increment =
+            this->device->valuator(valuator_t::SCROLL_Y).increment;
+        scroll_direction =
+            (vertical_value * increment) < 0.0 ? Button4 : Button5;
       } else {
         auto horizontal = this->valuator_relative_value(valuator_t::SCROLL_X);
         double horizontal_value = horizontal.value_or(0.0);
         if (horizontal_value != 0.0) {
-          scroll_direction = horizontal_value < 0.0 ? 6 : 7;
+          double increment =
+              this->device->valuator(valuator_t::SCROLL_X).increment;
+          scroll_direction = (horizontal_value * increment) < 0.0 ? 6 : 7;
         }
       }
 
-      XButtonEvent *e = &produced->xbutton;
-      e->display = display;
-      e->root = this->root;
-      e->window = target;
-      e->subwindow = child;
-      e->time = CurrentTime;
-      e->x = static_cast<int>(target_pos.x());
-      e->y = static_cast<int>(target_pos.y());
-      e->x_root = static_cast<int>(this->pos_absolute.x());
-      e->y_root = static_cast<int>(this->pos_absolute.y());
-      e->state = this->mods.effective;
-      e->button = scroll_direction;
-      e->same_screen = True;
+      if (scroll_direction != 0) {
+        XEvent *produced = new XEvent;
+        std::memset(produced, 0, sizeof(XEvent));
 
-      XEvent *press = new XEvent;
-      e->type = ButtonPress;
-      std::memcpy(press, produced, sizeof(XEvent));
-      result.emplace_back(std::make_tuple(ButtonPressMask, press));
+        XButtonEvent *e = &produced->xbutton;
+        e->display = display;
+        e->root = this->root;
+        e->window = target;
+        e->subwindow = child;
+        e->time = CurrentTime;
+        e->x = static_cast<int>(target_pos.x());
+        e->y = static_cast<int>(target_pos.y());
+        e->x_root = static_cast<int>(this->pos_absolute.x());
+        e->y_root = static_cast<int>(this->pos_absolute.y());
+        e->state = this->mods.effective;
+        e->button = scroll_direction;
+        e->same_screen = True;
 
-      e->type = ButtonRelease;
-      result.emplace_back(std::make_tuple(ButtonReleaseMask, produced));
+        XEvent *press = new XEvent;
+        e->type = ButtonPress;
+        std::memcpy(press, produced, sizeof(XEvent));
+        result.emplace_back(std::make_tuple(ButtonPressMask, press));
+
+        e->type = ButtonRelease;
+        result.emplace_back(std::make_tuple(ButtonReleaseMask, produced));
+      }
     }
   } else {
     XEvent *produced = new XEvent;
@@ -633,6 +706,6 @@ std::vector<std::tuple<int, XEvent *>> xi_event_data::generate_events(
 
   return result;
 }
-#endif /* BUILD_XINPUT */
+#endif /* BUILD_X11 */
 
 }  // namespace conky

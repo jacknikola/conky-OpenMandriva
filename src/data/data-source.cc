@@ -23,6 +23,7 @@
 #include <config.h>
 
 #include "data-source.hh"
+#include "../logging.h"
 
 #include <iostream>
 #include <sstream>
@@ -50,12 +51,12 @@ data_sources_t *data_sources;
 
 data_source_base &get_data_source(lua::state *l) {
   if (l->gettop() != 1) {
-    throw std::runtime_error("Wrong number of parameters");
+    CRIT_ERR("wrong number of parameters for data source getter");
   }
 
   l->rawgetfield(lua::REGISTRYINDEX, priv::data_source_metatable);
   if (!l->getmetatable(-2) || !l->rawequal(-1, -2)) {
-    throw std::runtime_error("Invalid parameter");
+    CRIT_ERR("invalid parameter for data source getter");
   }
 
   return *static_cast<data_source_base *>(l->touserdata(1));
@@ -99,8 +100,7 @@ void do_register_data_source(const std::string &name,
 
   bool inserted = data_sources->insert({name, fn}).second;
   if (!inserted) {
-    throw std::logic_error("Data source with name '" + name +
-                           "' already registered");
+    CRIT_ERR("data source '{}' already registered", name);
   }
 }
 
@@ -108,10 +108,8 @@ disabled_data_source::disabled_data_source(lua::state *l,
                                            const std::string &name,
                                            const std::string &setting)
     : simple_numeric_source<float>(l, name, &NaN) {
-  // XXX some generic way of reporting errors? NORM_ERR?
-  std::cerr << "Support for variable '" << name
-            << "' has been disabled during compilation. Please recompile with '"
-            << setting << "'" << std::endl;
+  LOG_WARNING("variable '{}' disabled at compile time, recompile with '{}'",
+              name, setting);
 }
 }  // namespace priv
 

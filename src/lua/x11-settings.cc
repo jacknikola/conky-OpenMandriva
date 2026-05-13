@@ -36,7 +36,7 @@ bool use_xdbe_setting::set_up(lua::state &l) {
   int major, minor;
 
   if (XdbeQueryExtension(display, &major, &minor) == 0) {
-    NORM_ERR("No compatible double buffer extension found");
+    LOG_ERROR("no compatible double buffer extension found");
     return false;
   }
 
@@ -45,7 +45,7 @@ bool use_xdbe_setting::set_up(lua::state &l) {
   if (window.back_buffer != None) {
     window.drawable = window.back_buffer;
   } else {
-    NORM_ERR("Failed to allocate back buffer");
+    LOG_ERROR("failed to allocate xdbe back buffer");
     return false;
   }
 
@@ -64,7 +64,7 @@ void use_xdbe_setting::lua_setter(lua::state &l, bool init) {
       l.pushboolean(false);
     }
 
-    NORM_ERR("drawing to %s buffer",
+    LOG_INFO("drawing to {} buffer",
              do_convert(l, -1).first ? "double" : "single");
   }
 
@@ -76,13 +76,15 @@ bool use_xpmdb_setting::set_up(lua::state &l) {
   // double_buffer makes no sense when not drawing to X
   if (!out_to_x.get(l)) return false;
 
+  unsigned int depth = window.color_depth != 0 ? window.color_depth
+                                                : DefaultDepth(display, screen);
   window.back_buffer =
-      XCreatePixmap(display, window.window, window.geometry.width() + 1, window.geometry.height() + 1,
-                    DefaultDepth(display, screen));
+      XCreatePixmap(display, window.window, window.geometry.width() + 1,
+                    window.geometry.height() + 1, depth);
   if (window.back_buffer != None) {
     window.drawable = window.back_buffer;
   } else {
-    NORM_ERR("Failed to allocate back buffer");
+    LOG_ERROR("failed to allocate pixmap back buffer");
     return false;
   }
 
@@ -101,7 +103,7 @@ void use_xpmdb_setting::lua_setter(lua::state &l, bool init) {
       l.pushboolean(false);
     }
 
-    NORM_ERR("drawing to %s buffer",
+    LOG_INFO("drawing to {} buffer",
              do_convert(l, -1).first ? "double" : "single");
   }
 

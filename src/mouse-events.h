@@ -23,6 +23,7 @@
 
 #include <bitset>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "config.h"
@@ -30,25 +31,20 @@
 #include "geometry.h"
 #include "logging.h"
 
-#ifdef BUILD_XINPUT
+#ifdef BUILD_X11
 #include <array>
 #include <map>
-#include <optional>
 #include <tuple>
 #include <variant>
 #include <vector>
-#endif /* BUILD_XINPUT */
+#endif /* BUILD_X11 */
 
 extern "C" {
 #ifdef BUILD_X11
 #include <X11/X.h>
-
-#ifdef BUILD_XINPUT
 #include <X11/extensions/XInput.h>
 #include <X11/extensions/XInput2.h>
 #undef COUNT  // define from X11/extensions/Xi.h
-
-#endif /* BUILD_XINPUT */
 #endif /* BUILD_X11 */
 
 #include <lua.h>
@@ -106,29 +102,23 @@ constexpr uint32_t operator*(mouse_button_t index) {
 }
 
 #ifdef BUILD_X11
-inline mouse_button_t x11_mouse_button_code(unsigned int x11_mouse_button) {
-  mouse_button_t button;
+inline std::optional<mouse_button_t> x11_mouse_button_code(
+    unsigned int x11_mouse_button) {
   switch (x11_mouse_button) {
     case Button1:
-      button = mouse_button_t::LEFT;
-      break;
+      return mouse_button_t::LEFT;
     case Button2:
-      button = mouse_button_t::MIDDLE;
-      break;
+      return mouse_button_t::MIDDLE;
     case Button3:
-      button = mouse_button_t::RIGHT;
-      break;
+      return mouse_button_t::RIGHT;
     case 8:
-      button = mouse_button_t::BACK;
-      break;
+      return mouse_button_t::BACK;
     case 9:
-      button = mouse_button_t::FORWARD;
-      break;
+      return mouse_button_t::FORWARD;
     default:
-      DBGP("X11 button %d is not mapped", x11_mouse_button);
-      break;
+      LOG_TRACE("X11 button {} is not mapped", x11_mouse_button);
+      return std::nullopt;
   }
-  return button;
 }
 #endif /* BUILD_X11 */
 
@@ -261,7 +251,7 @@ struct mouse_crossing_event : public mouse_positioned_event {
 };
 #endif /* BUILD_MOUSE_EVENTS */
 
-#ifdef BUILD_XINPUT
+#ifdef BUILD_X11
 typedef int xi_device_id;
 typedef int xi_event_type;
 
@@ -272,11 +262,14 @@ constexpr uint8_t operator*(valuator_t index) {
 }
 
 struct conky_valuator_info {
-  size_t index;
-  double min;
-  double max;
-  double value;
-  bool relative;
+  size_t index = SIZE_MAX;
+  double min = 0.0;
+  double max = 0.0;
+  double value = 0.0;
+  bool relative = false;
+  /// Scroll increment from XIScrollClassInfo; sign defines direction convention.
+  /// Positive means increasing valuator value = down/right.
+  double increment = 1.0;
 };
 
 struct device_info {
@@ -339,7 +332,7 @@ struct xi_event_data {
       Window target, Window child, conky::vec2d target_pos) const;
 };
 
-#endif /* BUILD_XINPUT */
+#endif /* BUILD_X11 */
 }  // namespace conky
 
 #endif /* MOUSE_EVENTS_H */

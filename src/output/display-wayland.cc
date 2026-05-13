@@ -46,6 +46,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <sstream>
 
 #include "../conky.h"
@@ -248,7 +249,7 @@ display_output_wayland::display_output_wayland()
 
 bool display_output_wayland::detect() {
   if (out_to_wayland.get(*state)) {
-    DBGP2("Wayland display output '%s' enabled in config.", name.c_str());
+    LOG_DEBUG("wayland display output '{}' enabled in config", name);
     return true;
   }
   return false;
@@ -266,8 +267,8 @@ struct window {
   struct wl_surface *surface;
   struct zwlr_layer_surface_v1 *layer_surface;
   int scale, pending_scale;
-  cairo_surface_t *cairo_surface;
-  cairo_t *cr;
+  std::shared_ptr<cairo_surface_t> cairo_surface;
+  std::shared_ptr<cairo_t> cr;
   PangoLayout *layout;
   PangoContext *pango_context;
 };
@@ -549,12 +550,12 @@ static const wl_seat_listener seat_listener = {
 bool display_output_wayland::initialize() {
   epoll_fd = epoll_create1(0);
   if (epoll_fd < 0) {
-    perror("conky: epoll_create");
+    LOG_ERROR("epoll_create failed: {}", strerror(errno));
     return false;
   }
   global_display = wl_display_connect(NULL);
   if (!global_display) {
-    perror("conky: wl_display_connect");
+    LOG_ERROR("wl_display_connect failed: {}", strerror(errno));
     return false;
   }
 
@@ -564,9 +565,9 @@ bool display_output_wayland::initialize() {
   wl_display_roundtrip(global_display);
   if (wl_globals.layer_shell == nullptr) {
     // TODO: Implement OWN_WINDOW and XDG Shell support
-    CRIT_ERR(
-        "Compositor doesn't support wlr-layer-shell-unstable-v1. Can't run "
-        "conky.");
+    SYSTEM_ERR(
+        "compositor doesn't support wlr-layer-shell-unstable-v1, can't run "
+        "conky");
   }
 
   struct wl_surface *surface =
@@ -605,14 +606,14 @@ bool display_output_wayland::main_loop_wait(double t) {
   errno = 0;
   while (wl_display_prepare_read(global_display) != 0) {
     if (wl_display_dispatch_pending(global_display) == -1) {
-      CRIT_ERR("wayland error: %s", strerror(errno));
+      SYSTEM_ERR("wayland dispatch error: {}", strerror(errno));
     }
   }
 
   errno = 0;
   if (wl_display_flush(global_display) < 0 && errno != EAGAIN) {
     wl_display_cancel_read(global_display);
-    CRIT_ERR("wayland error: %s", strerror(errno));
+    SYSTEM_ERR("wayland flush error: {}", strerror(errno));
   }
 
   if (t < 0.0) { t = 0.0; }
@@ -625,7 +626,7 @@ bool display_output_wayland::main_loop_wait(double t) {
     ep[0].data.ptr = nullptr;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wl_display_get_fd(global_display),
                   &ep[0]) == -1) {
-      CRIT_ERR("unable to setup epoll for display fd");
+      SYSTEM_ERR("unable to setup epoll for wayland display fd");
       return false;
     }
     configured_epoll = true;
@@ -635,7 +636,7 @@ bool display_output_wayland::main_loop_wait(double t) {
   int ep_count = epoll_wait(epoll_fd, ep, ARRAY_LENGTH(ep), ms);
 
   if (ep_count > 0) {
-    if (ep[0].events & (EPOLLERR | EPOLLHUP)) { CRIT_ERR("output closed"); }
+    if (ep[0].events & (EPOLLERR | EPOLLHUP)) { SYSTEM_ERR("wayland output closed unexpectedly"); }
   }
 
   int read_status = 0;
@@ -648,7 +649,7 @@ bool display_output_wayland::main_loop_wait(double t) {
   if (read_status == 0) {
     int num = wl_display_dispatch_pending(global_display);
     (void)num;
-    DBGP2("dispatched %d Wayland events", num);
+    LOG_TRACE("dispatched {} Wayland events", num);
   }
 
   wl_display_flush(global_display);
@@ -689,8 +690,6 @@ bool display_output_wayland::main_loop_wait(double t) {
       window_resize(global_window, width, height); /* resize window */
 
       changed++;
-      /* update lua window globals */
-      llua_update_window_table(conky::rect<int>(text_start, text_size));
     }
 
 /* move window if it isn't in right position */
@@ -705,8 +704,7 @@ bool display_output_wayland::main_loop_wait(double t) {
     if (changed != 0) {
       int anchor = 0;
 
-      DBGP("%s", _(PACKAGE_NAME ": defining struts\n"));
-      fflush(stderr);
+      LOG_DEBUG("defining struts");
 
       alignment text_align = text_alignment.get(*state);
       switch (vertical_alignment(text_align)) {
@@ -739,6 +737,10 @@ bool display_output_wayland::main_loop_wait(double t) {
                                          gap_y.get(*state), gap_x.get(*state));
       }
     }
+
+    /* update lua window globals */
+    llua_update_window_table(conky::vec2i(width, height),
+                             conky::rect<int>(text_start, text_size));
 
     clear_text(1);
     draw_stuff();
@@ -802,7 +804,7 @@ void display_output_wayland::cleanup() {
 void display_output_wayland::set_foreground_color(Colour c) {
   current_color = c;
   if (global_window->cr) {
-    cairo_set_source_rgba(global_window->cr, current_color.red / 255.0,
+    cairo_set_source_rgba(global_window->cr.get(), current_color.red / 255.0,
                           current_color.green / 255.0,
                           current_color.blue / 255.0,
                           current_color.alpha / 255.0);
@@ -831,88 +833,99 @@ static void adjust_coords(int &x, int &y) {
 void display_output_wayland::draw_string_at(int x, int y, const char *s,
                                             int w) {
   struct window *window = global_window;
+  auto cr = window->cr.get();
   y -= pango_fonts[selected_font].metrics.ascent;
   adjust_coords(x, y);
   pango_layout_set_text(window->layout, s, strlen(s));
-  cairo_save(window->cr);
+  cairo_save(cr);
   uint8_t r = current_color.red;
   uint8_t g = current_color.green;
   uint8_t b = current_color.blue;
   unsigned int a = pango_fonts[selected_font].font_alpha;
-  cairo_set_source_rgba(global_window->cr, r / 255.0, g / 255.0, b / 255.0,
-                        a / 65535.);
-  cairo_move_to(window->cr, x, y);
-  pango_cairo_show_layout(window->cr, window->layout);
-  cairo_restore(window->cr);
+  cairo_set_source_rgba(cr, r / 255.0, g / 255.0, b / 255.0, a / 65535.);
+  cairo_move_to(cr, x, y);
+  pango_cairo_show_layout(cr, window->layout);
+  cairo_restore(cr);
 }
 
 void display_output_wayland::set_line_style(int w, bool solid) {
   struct window *window = global_window;
+  auto cr = window->cr.get();
   static double dashes[2] = {1.0, 1.0};
   if (solid)
-    cairo_set_dash(window->cr, nullptr, 0, 0);
+    cairo_set_dash(cr, nullptr, 0, 0);
   else
-    cairo_set_dash(window->cr, dashes, 2, 0);
-  cairo_set_line_width(window->cr, w);
+    cairo_set_dash(cr, dashes, 2, 0);
+  cairo_set_line_width(cr, w);
 }
 
 void display_output_wayland::set_dashes(char *s) {
   struct window *window = global_window;
+  auto cr = window->cr.get();
   size_t len = strlen(s);
   double *dashes = new double[len];
   for (size_t i = 0; i < len; i++) { dashes[i] = s[i]; }
-  cairo_set_dash(window->cr, dashes, len, 0);
+  cairo_set_dash(cr, dashes, len, 0);
   delete[] dashes;
 }
 
 void display_output_wayland::draw_line(int x1, int y1, int x2, int y2) {
   struct window *window = global_window;
+  auto cr = window->cr.get();
   adjust_coords(x1, y1);
   adjust_coords(x2, y2);
-  cairo_save(window->cr);
-  cairo_move_to(window->cr, x1 - 0.5, y1 - 0.5);
-  cairo_line_to(window->cr, x2 - 0.5, y2 - 0.5);
-  cairo_stroke(window->cr);
-  cairo_restore(window->cr);
+  cairo_save(cr);
+  cairo_move_to(cr, x1 - 0.5, y1 - 0.5);
+  cairo_line_to(cr, x2 - 0.5, y2 - 0.5);
+  cairo_stroke(cr);
+  cairo_restore(cr);
 }
 
-static void do_rect(int x, int y, int w, int h, bool fill) {
-  struct window *window = global_window;
+std::weak_ptr<conky::draw_surface> display_output_wayland::drawing_surface() {
+  if (!global_window) { return {}; }
+  return global_window->cairo_surface;
+}
+
+template <bool Fill>
+inline void do_rect(cairo_t *cr, int x, int y, int w, int h) {
   adjust_coords(x, y);
 
-  cairo_save(window->cr);
-  if (fill) {
+  cairo_save(cr);
+  if constexpr (Fill) {
     /* Note that cairo interprets fill and stroke coordinates differently,
     so here we don't add 0.5 to move between centers and corners of pixels. */
-    cairo_rectangle(window->cr, x, y, w - 1, h - 1);
-    cairo_fill(window->cr);
+    cairo_rectangle(cr, x, y, w - 1, h - 1);
+    cairo_fill(cr);
   } else {
-    cairo_rectangle(window->cr, x - 0.5, y - 0.5, w, h);
-    cairo_stroke(window->cr);
+    cairo_rectangle(cr, x - 0.5, y - 0.5, w, h);
+    cairo_stroke(cr);
   }
-  cairo_restore(window->cr);
+  cairo_restore(cr);
 }
 
 void display_output_wayland::draw_rect(int x, int y, int w, int h) {
-  do_rect(x, y, w, h, false);
+  auto cr = global_window->cr.get();
+  do_rect<false>(cr, x, y, w, h);
 }
 
 void display_output_wayland::fill_rect(int x, int y, int w, int h) {
-  do_rect(x, y, w, h, true);
+  auto cr = global_window->cr.get();
+  do_rect<true>(cr, x, y, w, h);
 }
 
 void display_output_wayland::draw_arc(int x, int y, int w, int h, int a1,
                                       int a2) {
   struct window *window = global_window;
+  auto cr = window->cr.get();
   adjust_coords(x, y);
-  cairo_save(window->cr);
-  cairo_translate(window->cr, x + w / 2. - 0.5, y + h / 2. - 0.5);
-  cairo_scale(window->cr, w / 2., h / 2.);
-  cairo_set_line_width(window->cr, 2. / (w + h));
+  cairo_save(cr);
+  cairo_translate(cr, x + w / 2. - 0.5, y + h / 2. - 0.5);
+  cairo_scale(cr, w / 2., h / 2.);
+  cairo_set_line_width(cr, 2. / (w + h));
   double mult = M_PI / (180. * 64.);
-  cairo_arc_negative(window->cr, 0., 0., 1., a1 * mult, a2 * mult);
-  cairo_stroke(window->cr);
-  cairo_restore(window->cr);
+  cairo_arc_negative(cr, 0., 0., 1., a1 * mult, a2 * mult);
+  cairo_stroke(cr);
+  cairo_restore(cr);
 }
 
 void display_output_wayland::move_win(int x, int y) {
@@ -928,23 +941,20 @@ void display_output_wayland::end_draw_stuff() {
 
 void display_output_wayland::clear_text(int exposures) {
   struct window *window = global_window;
-  cairo_save(window->cr);
+  auto cr = window->cr.get();
+  cairo_save(cr);
 
-  Colour color;
-  if (set_transparent.get(*state)) {
-    color.alpha = 0;
-  } else {
-    color = background_colour.get(*state);
-    color.alpha = own_window_argb_value.get(*state);
-  }
+  Colour color = get_background_colour_preference(*state);
 
-  cairo_set_source_rgba(window->cr, color.red / 255.0, color.green / 255.0,
+  cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+  cairo_paint(cr);
+  cairo_set_source_rgba(cr, color.red / 255.0, color.green / 255.0,
                         color.blue / 255.0, color.alpha / 255.0);
-  cairo_set_operator(window->cr, CAIRO_OPERATOR_CLEAR);
-  cairo_rectangle(window->cr, 0, 0, window->rectangle.width(),
-                  window->rectangle.height());
-  cairo_fill(window->cr);
-  cairo_restore(window->cr);
+  cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+  cairo_rectangle(cr, 0, 0, window->rectangle.width(),
+                    window->rectangle.height());
+  cairo_fill(cr);
+  cairo_restore(cr);
 }
 
 int display_output_wayland::font_height(unsigned int f) {
@@ -1067,13 +1077,13 @@ static struct wl_shm_pool *make_shm_pool(struct wl_shm *shm, int size,
 
   fd = os_create_anonymous_file(size);
   if (fd < 0) {
-    fprintf(stderr, "creating a buffer file for %d B failed: %m\n", size);
+    LOG_ERROR("creating a buffer file for {}B failed: {}", size, strerror(errno));
     return NULL;
   }
 
   *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (*data == MAP_FAILED) {
-    fprintf(stderr, "mmap failed: %m\n");
+    LOG_ERROR("mmap failed for {}B buffer: {}", size, strerror(errno));
     close(fd);
     return NULL;
   }
@@ -1131,10 +1141,8 @@ static int data_length_for_shm_surface(rect<size_t> *rect, int scale) {
   return stride * rect->height() * scale;
 }
 
-static cairo_surface_t *create_shm_surface_from_pool(void *none,
-                                                     rect<size_t> *rectangle,
-                                                     struct shm_pool *pool,
-                                                     int scale) {
+static std::shared_ptr<conky::draw_surface> create_shm_surface_from_pool(
+    void *none, rect<size_t> *rectangle, struct shm_pool *pool, int scale) {
   struct shm_surface_data *data;
   uint32_t format;
   cairo_surface_t *surface;
@@ -1170,7 +1178,9 @@ static cairo_surface_t *create_shm_surface_from_pool(void *none,
   data->buffer = wl_shm_pool_create_buffer(pool->pool, offset, scaled.x(),
                                            scaled.y(), stride, format);
 
-  return surface;
+  return std::shared_ptr<conky::draw_surface>(surface, [](auto it) {
+    if (it) cairo_surface_destroy(it);
+  });
 }
 
 void window_allocate_buffer(struct window *window) {
@@ -1181,27 +1191,32 @@ void window_allocate_buffer(struct window *window) {
   pool = shm_pool_create(
       window->shm, data_length_for_shm_surface(&window->rectangle, scale));
   if (!pool) {
-    fprintf(stderr, "could not allocate shm pool\n");
+    LOG_ERROR("could not allocate shm pool for {}x{} window",
+              window->rectangle.width(), window->rectangle.height());
     return;
   }
 
   window->cairo_surface = create_shm_surface_from_pool(
       window->shm, &window->rectangle, pool, scale);
-  cairo_surface_set_device_scale(window->cairo_surface, scale, scale);
+  auto cs = window->cairo_surface.get();
+  cairo_surface_set_device_scale(cs, scale, scale);
 
   if (!window->cairo_surface) {
     shm_pool_destroy(pool);
     return;
   }
 
-  window->cr = cairo_create(window->cairo_surface);
-  window->layout = pango_cairo_create_layout(window->cr);
-  window->pango_context = pango_cairo_create_context(window->cr);
+  window->cr = std::shared_ptr<cairo_t>(cairo_create(cs), [](auto it) {
+    if (it) cairo_destroy(it);
+  });
+  auto cr = window->cr.get();
+  window->layout = pango_cairo_create_layout(cr);
+  window->pango_context = pango_cairo_create_context(cr);
 
   /* make sure we destroy the pool when the surface is destroyed */
   struct shm_surface_data *data;
-  data = static_cast<struct shm_surface_data *>(cairo_surface_get_user_data(
-      window->cairo_surface, &shm_surface_data_key));
+  data = static_cast<struct shm_surface_data *>(
+      cairo_surface_get_user_data(cs, &shm_surface_data_key));
   data->pool = pool;
 }
 
@@ -1227,12 +1242,10 @@ struct window *window_create(struct wl_surface *surface, struct wl_shm *shm,
 }
 
 void window_free_buffer(struct window *window) {
-  cairo_surface_destroy(window->cairo_surface);
-  cairo_destroy(window->cr);
+  window->cr = nullptr;
+  window->cairo_surface = nullptr;
   g_object_unref(window->layout);
   g_object_unref(window->pango_context);
-  window->cairo_surface = nullptr;
-  window->cr = nullptr;
   window->layout = nullptr;
   window->pango_context = nullptr;
 }
@@ -1260,7 +1273,7 @@ void window_commit_buffer(struct window *window) {
   wl_surface_set_buffer_scale(global_window->surface,
                               global_window->pending_scale);
   wl_surface_attach(window->surface,
-                    get_buffer_from_cairo_surface(window->cairo_surface), 0, 0);
+                    get_buffer_from_cairo_surface(window->cairo_surface.get()), 0, 0);
   /* repaint all the pixels in the surface, change size to only repaint changed
    * area*/
   wl_surface_damage(window->surface, window->rectangle.x(),

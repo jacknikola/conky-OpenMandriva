@@ -1,4 +1,5 @@
 #include "../content/colours.hh"
+#include "../logging.h"
 
 #include <X11/Xlib.h>
 
@@ -23,7 +24,7 @@ unsigned long Colour::to_x11_color(Display *display, int screen,
     xcolor.green = this->green * 257;
     xcolor.blue = this->blue * 257;
     if (XAllocColor(display, DefaultColormap(display, screen), &xcolor) == 0) {
-      // NORM_ERR("can't allocate X color");
+      LOG_WARNING("can't allocate X color ({}, {}, {})", this->red, this->green, this->blue);
       return 0;
     }
 
@@ -33,13 +34,14 @@ unsigned long Colour::to_x11_color(Display *display, int screen,
   }
 
   pixel &= 0xffffff;
-#ifdef BUILD_ARGB
+
   if (transparency) {
-    if (premultiply)
+    if (premultiply) {
       pixel = (red * alpha / 255) << 16 | (green * alpha / 255) << 8 |
               (blue * alpha / 255);
+    }
     pixel |= ((unsigned long)alpha << 24);
   }
-#endif /* BUILD_ARGB */
+
   return pixel;
 }

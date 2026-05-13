@@ -27,11 +27,11 @@
 #include <time.h>
 #include <cmath>
 #include <mutex>
-#include "ccurl_thread.h"
 #include "../../conky.h"
-#include "../../logging.h"
-#include "prss.h"
 #include "../../content/text_object.h"
+#include "../../logging.h"
+#include "ccurl_thread.h"
+#include "prss.h"
 
 struct rss_data {
   char uri[128];
@@ -52,7 +52,7 @@ class rss_cb : public curl_callback<std::shared_ptr<PRSS>> {
 
       std::unique_lock<std::mutex> lock(Base::result_mutex);
       Base::result = tmp;
-    } catch (std::runtime_error &e) { NORM_ERR("%s", e.what()); }
+    } catch (std::runtime_error &e) { LOG_ERROR("rss parse failed: {}", e.what()); }
   }
 
  public:
@@ -60,6 +60,18 @@ class rss_cb : public curl_callback<std::shared_ptr<PRSS>> {
       : Base(period, Base::Tuple(uri)) {}
 };
 }  // namespace
+
+void rss_safe_append(char *dest, unsigned int dest_size, const char *src) {
+  if (dest == nullptr || src == nullptr || dest_size == 0) { return; }
+
+  size_t used = strnlen(dest, dest_size);
+  if (used >= dest_size - 1) {
+    dest[dest_size - 1] = '\0';
+    return;
+  }
+
+  snprintf(dest + used, dest_size - used, "%s", src);
+}
 
 static void rss_process_info(char *p, int p_max_size, const std::string &uri,
                              char *action, int act_par, int interval,
@@ -110,6 +122,7 @@ static void rss_process_info(char *p, int p_max_size, const std::string &uri,
       if (data->item_count > 0) {
         int itmp;
         int show;
+        *p = 0;
         //'tmpspaces' is a string with spaces too be placed in front of each
         // title
         char *tmpspaces = (char *)malloc(nrspaces + 1);
@@ -127,20 +140,20 @@ static void rss_process_info(char *p, int p_max_size, const std::string &uri,
           str = item->title;
           if (str) {
             // don't add new line before first item
-            if (itmp > 0) { strncat(p, "\n", p_max_size); }
+            if (itmp > 0) { rss_safe_append(p, p_max_size, "\n"); }
             /* remove trailing new line if one exists,
              * we have our own */
             if (strlen(str) > 0 && str[strlen(str) - 1] == '\n') {
               str[strlen(str) - 1] = 0;
             }
-            strncat(p, tmpspaces, p_max_size);
-            strncat(p, str, p_max_size);
+            rss_safe_append(p, p_max_size, tmpspaces);
+            rss_safe_append(p, p_max_size, str);
           }
         }
         free(tmpspaces);
       }
     } else {
-      NORM_ERR("rss: Invalid action '%s'", action);
+      LOG_ERROR("invalid action '{}'", action);
     }
   }
 }
@@ -155,7 +168,7 @@ void rss_scan_arg(struct text_object *obj, const char *arg) {
   argc = sscanf(arg, "%127s %f %63s %d %u", rd->uri, &rd->interval, rd->action,
                 &rd->act_par, &rd->nrspaces);
   if (argc < 3) {
-    NORM_ERR("wrong number of arguments for $rss");
+    LOG_ERROR("wrong number of arguments for $rss, expected: url interval action [param] [spaces]");
     free(rd);
     return;
   }
@@ -166,7 +179,7 @@ void rss_print_info(struct text_object *obj, char *p, unsigned int p_max_size) {
   struct rss_data *rd = (struct rss_data *)obj->data.opaque;
 
   if (!rd) {
-    NORM_ERR("error processing RSS data");
+    LOG_ERROR("error processing RSS data");
     return;
   }
   rss_process_info(p, p_max_size, rd->uri, rd->action, rd->act_par,

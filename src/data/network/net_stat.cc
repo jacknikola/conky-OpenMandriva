@@ -334,7 +334,15 @@ void parse_net_stat_graph_arg(struct text_object *obj, const char *arg,
                               void *free_at_crash) {
   /* scan arguments and get interface name back */
   auto [buf, skip] = scan_command(arg);
-  scan_graph(obj, arg + skip, 0, TRUE);
+
+  graph_data_key key = graph_parent_obj_key;
+  if (buf == nullptr) {
+    key = fmt::format("net:{}", DEFAULTNETDEV);
+  } else if (strcmp("$gw_iface", buf) != 0 && strcmp("${gw_iface}", buf) != 0) {
+    key = fmt::format("net:{}", buf);
+  } /* gw_iface resolves dynamically; fall back to obj-address keying */
+
+  scan_graph(obj, arg + skip, 0, TRUE, key);
 
   // default to DEFAULTNETDEV
   if (buf != nullptr) {
@@ -530,13 +538,13 @@ int interface_up(struct text_object *obj) {
 #else
   if ((fd = socket(PF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0) {
 #endif
-    CRIT_ERR("could not create sockfd");
+    SYSTEM_ERR("could not create socket for network interface query");
     return 0;
   }
   strncpy(ifr.ifr_name, dev, IFNAMSIZ);
   if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
     /* if device does not exist, treat like not up */
-    if (errno != ENODEV && errno != ENXIO) { perror("SIOCGIFFLAGS"); }
+    if (errno != ENODEV && errno != ENXIO) { LOG_ERROR("SIOCGIFFLAGS: {}", strerror(errno)); }
     goto END_FALSE;
   }
 
@@ -551,7 +559,7 @@ int interface_up(struct text_object *obj) {
   if (if_up_strictness.get(*state) == IFUP_LINK) { goto END_TRUE; }
 
   if (ioctl(fd, SIOCGIFADDR, &ifr) != 0) {
-    perror("SIOCGIFADDR");
+    LOG_ERROR("SIOCGIFADDR: {}", strerror(errno));
     goto END_FALSE;
   }
   if ((reinterpret_cast<struct sockaddr_in *>(&(ifr.ifr_addr)))

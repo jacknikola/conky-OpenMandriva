@@ -44,9 +44,9 @@ static iconv_t **iconv_cd = 0;
 
 int register_iconv(iconv_t *new_iconv) {
   iconv_cd = (void ***)realloc(iconv_cd, sizeof(iconv_t *) * (iconv_count + 1));
-  if (!iconv_cd) { CRIT_ERR("Out of memory"); }
+  if (!iconv_cd) { SYSTEM_ERR("failed to allocate iconv descriptor array"); }
   iconv_cd[iconv_count] = (void **)malloc(sizeof(iconv_t));
-  if (!iconv_cd[iconv_count]) { CRIT_ERR("Out of memory"); }
+  if (!iconv_cd[iconv_count]) { SYSTEM_ERR("failed to allocate iconv descriptor"); }
   memcpy(iconv_cd[iconv_count], new_iconv, sizeof(iconv_t));
   iconv_count++;
   return iconv_count;
@@ -92,7 +92,7 @@ void iconv_convert(size_t *a, char *buff_in, char *p, size_t p_max_size) {
     bytes =
         iconv(*iconv_cd[iconv_selected - 1], &ptr, &dummy1, &outptr, &dummy2);
     if (bytes == -1) {
-      NORM_ERR("Iconv codeset conversion failed");
+      LOG_ERROR("iconv codeset conversion failed: {}", strerror(errno));
       break;
     }
   }
@@ -110,18 +110,17 @@ void init_iconv_start(struct text_object *obj, void *free_at_crash,
   char iconv_to[ICONV_CODEPAGE_LENGTH];
 
   if (iconv_converting) {
-    CRIT_ERR_FREE(obj, free_at_crash,
-                  "You must stop your last iconv conversion before "
-                  "starting another");
+    COMMAND_ARG_ERR("iconv_start", "you must stop your last iconv conversion before "
+             "starting another");
   }
   if (sscanf(arg, "%s %s", iconv_from, iconv_to) != 2) {
-    CRIT_ERR_FREE(obj, free_at_crash, "Invalid arguments for iconv_start");
+    COMMAND_ARG_ERR("iconv_start", "invalid arguments for iconv_start, expected: <from_codepage> <to_codepage>");
   } else {
     iconv_t new_iconv;
 
     new_iconv = iconv_open(iconv_to, iconv_from);
     if (new_iconv == (iconv_t)(-1)) {
-      NORM_ERR("Can't convert from %s to %s.", iconv_from, iconv_to);
+      LOG_ERROR("can't convert from {} to {}", iconv_from, iconv_to);
     } else {
       obj->data.i = register_iconv(&new_iconv);
       iconv_converting = 1;

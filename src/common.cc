@@ -46,15 +46,15 @@
 
 #include "config.h"
 #include "conky.h"
-#include "core.h"
-#include "data/fs.h"
-#include "logging.h"
-#include "data/misc.h"
-#include "data/network/net_stat.h"
 #include "content/specials.h"
 #include "content/temphelper.h"
+#include "core.h"
+#include "data/fs.h"
+#include "data/misc.h"
+#include "data/network/net_stat.h"
 #include "data/timeinfo.h"
 #include "data/top.h"
+#include "logging.h"
 
 #if defined(_POSIX_C_SOURCE) && !defined(__OpenBSD__) && !defined(__HAIKU__)
 #include <wordexp.h>
@@ -117,7 +117,7 @@ int update_uname() {
 
     if (sysctlbyname("kern.version", nullptr, &desc_n, NULL, 0) == -1 ||
         sysctlbyname("kern.version", desc, &desc_n, nullptr, 0) == -1)
-      perror("kern.version");
+      LOG_ERROR("kern.version: {}", strerror(errno));
     else {
       char *start = desc;
       strsep(&start, " ");
@@ -189,7 +189,7 @@ std::filesystem::path to_real_path(const std::string &source) {
     return std::filesystem::weakly_canonical(absolute);
   } catch (const std::filesystem::filesystem_error &e) {
     // file not found or permission issues
-    NORM_ERR("can't canonicalize path: %s", source.c_str());
+    LOG_WARNING("can't canonicalize path '{}': {}", source, e.what());
     return source;
   }
 }
@@ -202,7 +202,7 @@ int open_fifo(const char *file, int *reported) {
 
   if (fd == -1) {
     if ((reported == nullptr) || *reported == 0) {
-      NORM_ERR("can't open %s: %s", file, strerror(errno));
+      LOG_ERROR("can't open fifo '{}': {}", file, strerror(errno));
       if (reported != nullptr) { *reported = 1; }
     }
     return -1;
@@ -218,7 +218,7 @@ FILE *open_file(const char *file, int *reported) {
 
   if (fp == nullptr) {
     if ((reported == nullptr) || *reported == 0) {
-      NORM_ERR("can't open %s: %s", file, strerror(errno));
+      LOG_ERROR("can't open file '{}': {}", file, strerror(errno));
       if (reported != nullptr) { *reported = 1; }
     }
     return nullptr;
@@ -234,10 +234,8 @@ std::filesystem::path get_cwd() {
   // Attempt to get the current working directory
   cwd = getcwd(buffer, sizeof(buffer));
   if (cwd == NULL) {
-    const char *error;
-    perror(error);
-    NORM_ERR("can't get conky current working directory: %s", error);
-    DBGP("returning '.' as PWD");  // hope things work out well
+    LOG_ERROR("can't get current working directory: {}", strerror(errno));
+    LOG_DEBUG("returning '.' as PWD fallback");
     return std::string(".");
   }
 
@@ -248,8 +246,7 @@ std::string current_username() {
   const char *user = std::getenv("USER");
 
   if (!user) {
-    NORM_ERR(
-        "can't determine current user (USER environment variable not set)");
+    LOG_ERROR("can't determine current user (USER environment variable not set)");
     return std::string();
   }
 
@@ -264,10 +261,7 @@ std::optional<std::filesystem::path> user_home(const std::string &username) {
 
   struct passwd *pw = getpwnam(username.c_str());
   if (!pw) {
-    DBGP(
-        "can't determine HOME directory for user %s (neither w/ HOME nor "
-        "getpwnam)",
-        username.c_str());
+    LOG_DEBUG("can't determine HOME directory for user '{}' (neither w/ HOME nor getpwnam)", username);
     return std::nullopt;
   }
   return std::filesystem::path(pw->pw_dir);
@@ -281,9 +275,7 @@ std::string tilde_expand(const std::string &unexpanded) {
   if (unexpanded.length() == 1) {
     auto home = user_home();
     if (home->empty()) {
-      NORM_ERR(
-          "can't expand '~' path because user_home couldn't locate home "
-          "directory");
+      LOG_WARNING("can't expand '~' path because user_home couldn't locate home directory");
       return unexpanded;
     }
     return home.value();
@@ -292,9 +284,7 @@ std::string tilde_expand(const std::string &unexpanded) {
   if (next == '/') {
     auto home = user_home();
     if (home->empty()) {
-      NORM_ERR(
-          "can't expand '~' path because user_home couldn't locate home "
-          "directory");
+      LOG_WARNING("can't expand '~' path because user_home couldn't locate home directory");
       return unexpanded;
     }
     return home.value().string() + unexpanded.substr(1);
@@ -471,7 +461,7 @@ void scan_loadavg_arg(struct text_object *obj, const char *arg) {
       (isdigit(static_cast<unsigned char>(arg[0])) != 0)) {
     obj->data.i = strtol(arg, nullptr, 10);
     if (obj->data.i > 3 || obj->data.i < 1) {
-      NORM_ERR("loadavg arg needs to be in range (1,3)");
+      LOG_WARNING("loadavg arg '{}' out of range, expected 1-3", arg);
       obj->data.i = 0;
     }
   }
@@ -505,7 +495,7 @@ void print_no_update(struct text_object *obj, char *p,
 
 #ifdef BUILD_GUI
 void scan_loadgraph_arg(struct text_object *obj, const char *arg) {
-  scan_graph(obj, arg, 0, FALSE);
+  scan_graph(obj, arg, 0, FALSE, "load");
 }
 
 double loadgraphval(struct text_object *obj) {
@@ -517,8 +507,7 @@ double loadgraphval(struct text_object *obj) {
 
 uint8_t cpu_percentage(struct text_object *obj) {
   if (static_cast<unsigned int>(obj->data.i) > info.cpu_count) {
-    NORM_ERR("obj->data.i %i info.cpu_count %i", obj->data.i, info.cpu_count);
-    CRIT_ERR("attempting to use more CPUs than you have!");
+    USER_ERR("attempting to use more CPUs than you have (requested CPU {}, but only {} available)", obj->data.i, info.cpu_count);
   }
   if (info.cpu_usage != nullptr) {
     return round_to_positive_int(info.cpu_usage[obj->data.i] * 100.0);
@@ -528,8 +517,7 @@ uint8_t cpu_percentage(struct text_object *obj) {
 
 double cpu_barval(struct text_object *obj) {
   if (static_cast<unsigned int>(obj->data.i) > info.cpu_count) {
-    NORM_ERR("obj->data.i %i info.cpu_count %i", obj->data.i, info.cpu_count);
-    CRIT_ERR("attempting to use more CPUs than you have!");
+    USER_ERR("attempting to use more CPUs than you have (requested CPU {}, but only {} available)", obj->data.i, info.cpu_count);
   }
   if (info.cpu_usage != nullptr) { return info.cpu_usage[obj->data.i]; }
   return 0.;
@@ -722,7 +710,7 @@ static int check_contains(char *f, char *s) {
     }
     fclose(where);
   } else {
-    NORM_ERR("Could not open the file");
+    LOG_DEBUG("could not open file '{}' for contains check", f);
   }
   return ret;
 }
@@ -743,9 +731,7 @@ int if_existing_iftest(struct text_object *obj) {
 }
 
 int if_running_iftest(struct text_object *obj) {
-  if (!is_process_running(obj->data.s)) {
-    return 0;
-  }
+  if (!is_process_running(obj->data.s)) { return 0; }
   return 1;
 }
 
@@ -859,6 +845,17 @@ void print_include(struct text_object *obj, char *p, unsigned int p_max_size) {
 }
 
 #ifdef BUILD_CURL
+namespace {
+constexpr char kGithubNotificationsUrl[] =
+    "https://api.github.com/notifications";
+}
+
+std::string github_notifications_url() { return kGithubNotificationsUrl; }
+
+std::string github_authorization_header(const std::string &token) {
+  return "Authorization: Bearer " + token;
+}
+
 #define NEW_TOKEN                       \
   "https://github.com/settings/tokens/" \
   "new?scopes=notifications&description=conky-query-github\n"
@@ -882,7 +879,7 @@ static size_t read_github_data_cb(char *data, size_t size, size_t nmemb,
           's' == *(ptr + 3) && z + 13 < sz) { /* "message": */
         if ('B' == *(ptr + 10) && 'a' == *(ptr + 11) &&
             'd' == *(ptr + 12)) { /* "Bad credentials" */
-          NORM_ERR("Bad credentials: generate a new token:\n" NEW_TOKEN);
+          LOG_ERROR("github: bad credentials, generate a new token at {}", NEW_TOKEN);
           snprintf(p, 80, "%s",
                    "GitHub: Bad credentials, generate a new token.");
           skip = 1U;
@@ -890,9 +887,7 @@ static size_t read_github_data_cb(char *data, size_t size, size_t nmemb,
         }
         if ('M' == *(ptr + 10) && 'i' == *(ptr + 11) &&
             's' == *(ptr + 12)) { /* Missing the 'notifications' scope. */
-          NORM_ERR(
-              "Missing 'notifications' scope. Generate a new "
-              "token\n" NEW_TOKEN);
+          LOG_ERROR("github: missing 'notifications' scope, generate a new token at {}", NEW_TOKEN);
           snprintf(
               p, 80, "%s",
               "GitHub: Missing the notifications scope. Generate a new token.");
@@ -908,18 +903,15 @@ static size_t read_github_data_cb(char *data, size_t size, size_t nmemb,
 
 void print_github(struct text_object *obj, char *p, unsigned int p_max_size) {
   (void)obj;
-  char github_url[256] = {""};
-  char user_agent[30] = {""};
   static char cached_result[256] = {""};
   static unsigned int last_update = 1U;
   CURL *curl = nullptr;
   CURLcode res;
+  struct curl_slist *headers = nullptr;
+  std::string token = github_token.get(*state);
 
-  if (0 == strcmp(github_token.get(*state).c_str(), "")) {
-    NORM_ERR(
-        "${github_notifications} requires token. "
-        "Go ahead and generate one " NEW_TOKEN
-        "Insert it in conky.config = { github_token='TOKEN_SHA' }\n");
+  if (token.empty()) {
+    LOG_ERROR("${{github_notifications}} requires a token, generate one at {} and add github_token='TOKEN' to conky.config", NEW_TOKEN);
     snprintf(p, p_max_size, "%s",
              "GitHub notifications requires token, generate a new one.");
     return;
@@ -931,21 +923,19 @@ void print_github(struct text_object *obj, char *p, unsigned int p_max_size) {
     return;
   }
 
-  snprintf(github_url, 255, "%s%s",
-           "https://api.github.com/notifications?access_token=",
-           github_token.get(*state).c_str());
-  /* unique string for each conky user, so we dont hit any query limits */
-  snprintf(user_agent, 29, "conky/%s", github_token.get(*state).c_str());
-
   curl_global_init(CURL_GLOBAL_ALL);
   if (nullptr == (curl = curl_easy_init())) { goto error; }
-  curl_easy_setopt(curl, CURLOPT_URL, github_url);
+  headers =
+      curl_slist_append(headers, github_authorization_header(token).c_str());
+  if (headers == nullptr) { goto error; }
+  curl_easy_setopt(curl, CURLOPT_URL, github_notifications_url().c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 #if defined(CURLOPT_ACCEPT_ENCODING)
   curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "gzip");
 #else  /* defined(CURLOPT_ACCEPT_ENCODING) */
   curl_easy_setopt(curl, CURLOPT_ENCODING, "gzip");
 #endif /* defined(CURLOPT_ACCEPT_ENCODING) */
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent);
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "conky-github/1.0");
   curl_easy_setopt(curl, CURLOPT_USE_SSL, (long)CURLUSESSL_ALL);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, read_github_data_cb);
@@ -957,6 +947,7 @@ void print_github(struct text_object *obj, char *p, unsigned int p_max_size) {
   last_update = 60U;
 
 error:
+  if (headers != nullptr) { curl_slist_free_all(headers); }
   if (nullptr != curl) { curl_easy_cleanup(curl); }
   curl_global_cleanup();
 

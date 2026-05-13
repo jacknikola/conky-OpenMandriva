@@ -205,9 +205,6 @@ else()
     "Xfixes support requires X11")
 endif(OS_DARWIN)
 
-dependent_option(BUILD_ARGB "Build ARGB (real transparency) support" true
-  "BUILD_X11;OWN_WINDOW" false
-  "ARGB support requires X11 and OWN_WINDOW enabled, not needed on Wayland")
 dependent_option(BUILD_XINERAMA "Build Xinerama support" true
   "BUILD_X11" false
   "Xinerama support requires X11")
@@ -223,10 +220,6 @@ dependent_option(BUILD_IMLIB2 "Enable Imlib2 support" true
 dependent_option(BUILD_XSHAPE "Enable Xshape support" true
   "BUILD_X11" false
   "Xshape support requires X11")
-dependent_option(BUILD_XINPUT "Build Xinput 2 support (slow)" false
-  "BUILD_X11" false
-  "Xinput 2 support requires X11")
-
 # if we build with any GUI support
 if(BUILD_X11)
   set(BUILD_GUI true)
@@ -253,6 +246,9 @@ dependent_option(BUILD_LUA_IMLIB2 "Build Imlib2 bindings for Lua" false
 dependent_option(BUILD_LUA_RSVG "Build rsvg bindings for Lua" false
   "BUILD_GUI" false
   "RSVG Lua bindings depend on BUILD_GUI")
+dependent_option(BUILD_LUA_TEXT "Build Fontconfig Freetype and Harfbuzz for Lua" false
+  "BUILD_GUI" false
+  "Text Lua bindings depend on BUILD_GUI")
 
 option(BUILD_OPENSOUNDSYS "Build with Open Sound System support" true)
 
@@ -290,7 +286,7 @@ option(BUILD_ICONV "Enable iconv support" false)
 
 option(BUILD_CMUS "Enable support for cmus music player" true)
 
-option(BUILD_JOURNAL "Enable support for reading from the systemd journal"
+option(BUILD_JOURNAL "Enable systemd journal support (reading and logging)"
   false)
 
 option(BUILD_PULSEAUDIO
