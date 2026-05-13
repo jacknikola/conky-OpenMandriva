@@ -2,7 +2,7 @@
 
 - NEED PACKAGES conky lib64c++ lib64c++abi lib64unwind1.0 lua AND imlib2 libxft imv imagemagick for proper image support. lib64imlib2-devel required. libxft-devel recommended. imv for display. imagemagick for image conversion, use latest version and install with an asterisk.
 
-- Please check the basic example provided in example directory for a basic slideshow. example directory MUST BE DELETED before attempting to compile, assume compilation failure otherwise.
+- Please check the basic example provided in example directory for a basic slideshow. The example directory MUST BE DELETED before attempting to compile, assume compilation failure otherwise.
 
 - RECOMMENDED TO DOWNLOAD LATEST RELEASE FROM BRNDNMTTHWS; RECOMMENDED TO CREATE A SYMLINK "conky"; sudo cp ~/conky /usr/bin; sudo chmod x+ /usr/bin/conky
 
