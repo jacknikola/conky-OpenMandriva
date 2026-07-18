@@ -30,10 +30,13 @@
 #include "config.h"
 
 #include "../lua/x11-settings.h"
+#include "x11-event.h"
 #include "x11.h"
 
 #include <X11/X.h>
 #include <X11/Xlibint.h>
+#include <X11/extensions/XI2.h>
+#include <functional>
 #undef min
 #undef max
 #include <sys/types.h>
@@ -47,7 +50,6 @@
 #include "../mouse-events.h"
 
 #include <algorithm>
-#include <vector>
 #include <array>
 #include <cstddef>
 #include <cstdio>
@@ -55,6 +57,7 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#include <vector>
 
 // #ifndef OWN_WINDOW
 // #include <iostream>
@@ -105,6 +108,17 @@ xcb_errors_context_t *xcb_errors_ctx;
 
 /* Window stuff */
 struct conky_x11_window window;
+
+/* Config settings (declared in x11-settings.h / gui.h) */
+conky::simple_config_setting<std::string> display_name("display", std::string(),
+                                                       false);
+conky::simple_config_setting<int> head_index("xinerama_head", 0, true);
+conky::simple_config_setting<bool> out_to_x("out_to_x", true, false);
+#ifdef BUILD_XFT
+conky::simple_config_setting<bool> use_xft("use_xft", false, false);
+#endif
+conky::simple_config_setting<bool> forced_redraw("forced_redraw", false, false);
+conky::simple_config_setting<bool> use_double_buffer("double_buffer", false, false);
 
 /* local prototypes */
 static Window find_desktop_window(Window *p_root, Window *p_desktop);
@@ -169,10 +183,10 @@ static int x11_error_handler(Display *d, XErrorEvent *err) {
     code_allocated = true;
   }
 
-  LOG_DEBUG(
-      "X {} error: display {:#x}, XID {}, serial {} -- {}",
-      error_name, reinterpret_cast<uint64_t>(err->display),
-      static_cast<int64_t>(err->resourceid), err->serial, code_description);
+  LOG_DEBUG("X {} error: display {:#x}, XID {}, serial {} -- {}", error_name,
+            reinterpret_cast<uint64_t>(err->display),
+            static_cast<int64_t>(err->resourceid), err->serial,
+            code_description);
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wfree-nonheap-object"
@@ -287,6 +301,49 @@ void deinit_x11() {
   }
 }
 
+bool x11_set_up_double_buffer(lua::state &l) {
+#ifdef BUILD_XDBE
+  // double_buffer makes no sense when not drawing to X
+  if (!out_to_x.get(l) || !display || !window.window) { return false; }
+
+  int major, minor;
+  if (XdbeQueryExtension(display, &major, &minor) == 0) {
+    LOG_ERROR("no compatible double buffer extension found");
+    return false;
+  }
+
+  window.back_buffer =
+      XdbeAllocateBackBufferName(display, window.window, XdbeBackground);
+  if (window.back_buffer != None) {
+    window.drawable = window.back_buffer;
+  } else {
+    LOG_ERROR("failed to allocate xdbe back buffer");
+    return false;
+  }
+
+  XFlush(display);
+  return true;
+#else
+  // double_buffer makes no sense when not drawing to X
+  if (!out_to_x.get(l)) return false;
+
+  unsigned int depth = window.color_depth != 0 ? window.color_depth
+                                               : DefaultDepth(display, screen);
+  window.back_buffer =
+      XCreatePixmap(display, window.window, window.geometry.width() + 1,
+                    window.geometry.height() + 1, depth);
+  if (window.back_buffer != None) {
+    window.drawable = window.back_buffer;
+  } else {
+    LOG_ERROR("failed to allocate pixmap back buffer");
+    return false;
+  }
+
+  XFlush(display);
+  return true;
+#endif
+}
+
 // Source: dunst
 // https://github.com/bebehei/dunst/blob/1bc3237a359f37905426012c0cca90d71c4b3b18/src/x11/x.c#L463
 void update_x11_resource_db(bool first_run) {
@@ -306,7 +363,7 @@ void update_x11_resource_db(bool first_run) {
     }
 
     // https://github.com/dunst-project/dunst/blob/master/src/x11/x.c#L499
-    display->db = NULL; // should be new or deleted
+    display->db = NULL;  // should be new or deleted
     db = XrmGetStringDatabase((const char *)prop.value);
     XrmSetDatabase(display, db);
   }
@@ -336,7 +393,8 @@ void update_x11_workarea() {
   int heads = 0;
   XineramaScreenInfo *si = XineramaQueryScreens(display, &heads);
   if (si == nullptr) {
-    LOG_WARNING("XineramaQueryScreens returned nullptr, ignoring head settings");
+    LOG_WARNING(
+        "XineramaQueryScreens returned nullptr, ignoring head settings");
     return; /* queryscreens failed? */
   }
 
@@ -371,8 +429,8 @@ static Window find_desktop_window(Window root) {
       find_desktop_window_impl(desktop, workarea.width(), workarea.height());
 
   if (desktop != root) {
-    LOG_DEBUG("desktop window {:#x} is subwindow of root window {:#x}",
-              desktop, root);
+    LOG_DEBUG("desktop window {:#x} is subwindow of root window {:#x}", desktop,
+              root);
   } else {
     LOG_DEBUG("desktop window {:#x} is root window", desktop);
   }
@@ -390,10 +448,11 @@ void set_transparent_background(conky_x11_window *window) {
     Colour colour = get_background_colour_preference(*state);
     unsigned long xcolor =
         colour.to_x11_color(display, screen, window->opacity < 0xff, true);
-    LOG_DEBUG("ARGB background: colour=({},{},{},{}) xcolor=0x{:08x} "
-              "opacity={}",
-              colour.red, colour.green, colour.blue, colour.alpha, xcolor,
-              window->opacity);
+    LOG_DEBUG(
+        "ARGB background: colour=({},{},{},{}) xcolor=0x{:08x} "
+        "opacity={}",
+        colour.red, colour.green, colour.blue, colour.alpha, xcolor,
+        window->opacity);
     XSetWindowBackground(display, window->window, xcolor);
     return;
   }
@@ -414,6 +473,13 @@ void set_transparent_background(conky_x11_window *window) {
     }
     return;
   }
+
+  // opaque window, or alpha was requested but no ARGB visual is available
+  // (e.g. no compositor): use the requested background colour as a solid
+  // fill, ignoring the alpha channel.
+  Colour colour = get_background_colour_preference(*state);
+  unsigned long xcolor = colour.to_x11_color(display, screen, false, false);
+  XSetWindowBackground(display, window->window, xcolor);
 }
 #endif /* OWN_WINDOW */
 
@@ -471,13 +537,11 @@ void destroy_window() {
   if (window.xftdraw != nullptr) { XftDrawDestroy(window.xftdraw); }
 #endif /* BUILD_XFT */
   if (window.gc != nullptr) { XFreeGC(display, window.gc); }
-  memset(&window, 0, sizeof(struct conky_x11_window));
+  window = conky_x11_window{};
 }
 
-void x11_init_window(lua::state &l, bool own) {
-  auto _scope = LOG_SCOPE("x11_init_window", {{"own", own}});
-  // own is unused if OWN_WINDOW is not defined
-  (void)own;
+void x11_init_window(lua::state &l) {
+  auto _scope = LOG_SCOPE("x11_init_window");
 
   window.root = VRootWindow(display, screen);
   if (window.root == None) {
@@ -491,7 +555,7 @@ void x11_init_window(lua::state &l, bool own) {
   window.colourmap = DefaultColormap(display, screen);
 
 #ifdef OWN_WINDOW
-  if (own) {
+  if (own_window.get(l)) {
     int flags = CWOverrideRedirect | CWBackingStore;
     window.color_depth = CopyFromParent;
 
@@ -504,10 +568,14 @@ void x11_init_window(lua::state &l, bool own) {
       window.opacity = background_alpha;
     } else if (wants_alpha) {
       if (background_alpha != 0) {
-        LOG_WARNING("ARGB visual not available (no compositor?), window will be opaque");
+        LOG_WARNING(
+            "ARGB visual not available (no compositor?), window will be "
+            "opaque");
       } else {
         window.opacity = 0;
-        LOG_WARNING("ARGB visual not available (no compositor?), using pseudo-transparency fallback");
+        LOG_WARNING(
+            "ARGB visual not available (no compositor?), using "
+            "pseudo-transparency fallback");
       }
     }
 
@@ -533,21 +601,12 @@ void x11_init_window(lua::state &l, bool own) {
     if (own_window_type.get(l) == window_type::OVERRIDE) {
       /* An override_redirect True window.
        * No WM hints or button processing needed. */
-      XSetWindowAttributes attrs = {ParentRelative,
-                                    0L,
-                                    0,
-                                    0L,
-                                    0,
-                                    0,
-                                    Always,
-                                    0L,
-                                    0L,
-                                    False,
-                                    StructureNotifyMask | ExposureMask,
-                                    0L,
-                                    True,
-                                    0,
-                                    0};
+      XSetWindowAttributes attrs = {
+          .background_pixmap = ParentRelative,
+          .backing_store = Always,
+          .event_mask = StructureNotifyMask | ExposureMask,
+          .override_redirect = True,
+      };
       flags |= CWBackPixel;
       if (window.opacity < 0xff) {
         attrs.colormap = window.colourmap;
@@ -569,22 +628,13 @@ void x11_init_window(lua::state &l, bool own) {
       /* A window managed by the window manager.
        * Process hints and buttons. */
       XSetWindowAttributes attrs = {
-          ParentRelative,
-          0L,
-          0,
-          0L,
-          0,
-          0,
-          Always,
-          0L,
-          0L,
-          False,
-          StructureNotifyMask | ExposureMask | ButtonPressMask |
-              ButtonReleaseMask,
-          0L,
-          own_window_type.get(l) == window_type::UTILITY ? True : False,
-          0,
-          0};
+          .background_pixmap = ParentRelative,
+          .backing_store = Always,
+          .event_mask = StructureNotifyMask | ExposureMask | ButtonPressMask |
+                        ButtonReleaseMask,
+          .override_redirect =
+              own_window_type.get(l) == window_type::UTILITY ? True : False,
+      };
 
       XWMHints wmHint;
       Atom xa;
@@ -600,9 +650,9 @@ void x11_init_window(lua::state &l, bool own) {
         window.geometry.set_pos(conky::vec2i::Zero());
       }
       /* Parent is root window so WM can take control */
-      window.window = XCreateWindow(display, window.root, window.geometry.x(),
-                                    window.geometry.y(), b, b, 0, window.color_depth,
-                                    InputOutput, window.visual, flags, &attrs);
+      window.window = XCreateWindow(
+          display, window.root, window.geometry.x(), window.geometry.y(), b, b,
+          0, window.color_depth, InputOutput, window.visual, flags, &attrs);
 
       uint16_t hints = own_window_hints.get(l);
 
@@ -819,9 +869,10 @@ void x11_init_window(lua::state &l, bool own) {
   int64_t input_mask = ExposureMask | PropertyChangeMask;
 #ifdef OWN_WINDOW
   if (own_window.get(l)) {
-    input_mask |= StructureNotifyMask;
+    // We use XI2 instead of ButtonPressMask and ButtonReleaseMask, but they
+    // need to be set so Fluxbox doesn't passively steal our input.
+    input_mask |= StructureNotifyMask | ButtonPressMask | ButtonReleaseMask;
   }
-  bool xinput_ok = false;
   // not a loop; substitutes goto with break - if checks fail
   do {
     int _ignored;  // segfault if NULL
@@ -835,36 +886,50 @@ void x11_init_window(lua::state &l, bool own) {
     int major = 2, minor = 0;
     int retval = XIQueryVersion(display, &major, &minor);
     if (retval != 0) {
-      LOG_WARNING("XInput 2.0 is not supported (supported version {}.{})", major, minor);
+      LOG_WARNING("XInput 2.0 is not supported (supported version {}.{})",
+                  major, minor);
       break;
     }
 
-    const std::size_t mask_size = (XI_LASTEVENT + 7) / 8;
-    unsigned char mask_bytes[mask_size] = {0}; /* must be zeroed! */
-    XISetMask(mask_bytes, XI_HierarchyChanged);
+    conky::xi_event_bitflags selected_events;
+    selected_events.set(XI_HierarchyChanged);
+    XIEventMask mask = selected_events.mask(XIAllDevices);
+    XISelectEvents(display, window.root, &mask, 1);
 #ifdef BUILD_MOUSE_EVENTS
-    XISetMask(mask_bytes, XI_Motion);
-    XISetMask(mask_bytes, XI_ButtonPress);
-    XISetMask(mask_bytes, XI_ButtonRelease);
-#endif /* BUILD_MOUSE_EVENTS */
+    selected_events.clear(XI_HierarchyChanged);
 
-    XIEventMask ev_masks[1];
-    ev_masks[0].deviceid = XIAllDevices;
-    ev_masks[0].mask_len = sizeof(mask_bytes);
-    ev_masks[0].mask = mask_bytes;
-    XISelectEvents(display, window.root, ev_masks, 1);
+    if (!own_window.get(l) && !conky::lua_mouse_hook.get(l).empty()) {
+      LOG_WARNING(
+          "registering `lua_mouse_hook` when `own_window = false` means conky "
+          "has to steal root events; WM desktop interactivity will likely seem "
+          "broken!");
 
-    if (own) {
+      selected_events.set(XI_Motion);
+      selected_events.set(XI_ButtonPress);
+      selected_events.set(XI_ButtonRelease);
+      selected_events.set(XI_Enter);
+      selected_events.set(XI_Leave);
+
+      mask = selected_events.mask(XIAllMasterDevices);
+      XISelectEvents(display, window.root, &mask, 1);
+    }
+#endif
+
+    if (own_window.get(l)) {
+      selected_events.clear_all();
+      selected_events.set(XI_ButtonPress);
+      selected_events.set(XI_ButtonRelease);
+      // It's not recommended to add event masks to special windows in X; causes
+      // a crash (thus own_window_type != window_type::DESKTOP)
+      if (own_window_type.get(l) != window_type::DESKTOP) {
+        selected_events.set(XI_Motion);
 #ifdef BUILD_MOUSE_EVENTS
-      XIClearMask(mask_bytes, XI_Motion);
+        selected_events.set(XI_Enter);
+        selected_events.set(XI_Leave);
 #endif /* BUILD_MOUSE_EVENTS */
-      XISetMask(mask_bytes, XI_ButtonPress);
-      XISetMask(mask_bytes, XI_ButtonRelease);
-
-      ev_masks[0].deviceid = XIAllDevices;
-      ev_masks[0].mask_len = sizeof(mask_bytes);
-      ev_masks[0].mask = mask_bytes;
-      XISelectEvents(display, window.window, ev_masks, 1);
+      }
+      mask = selected_events.mask(XIAllMasterDevices);
+      XISelectEvents(display, window.window, &mask, 1);
     }
 
     // setup cache
@@ -876,17 +941,7 @@ void x11_init_window(lua::state &l, bool own) {
       }
     }
     XFreeDeviceList(info);
-
-    xinput_ok = true;
   } while (false);
-  // Fallback to basic X11 enter/leave events if xinput fails to init.
-  // It's not recommended to add event masks to special windows in X; causes a
-  // crash (thus own_window_type != TYPE_DESKTOP)
-#ifdef BUILD_MOUSE_EVENTS
-  if (!xinput_ok && own && own_window_type.get(l) != window_type::DESKTOP) {
-    input_mask |= PointerMotionMask | EnterWindowMask | LeaveWindowMask;
-  }
-#endif /* BUILD_MOUSE_EVENTS */
 #endif /* OWN_WINDOW */
   window.event_mask = input_mask;
   XSelectInput(display, window.window, input_mask);
@@ -1036,9 +1091,9 @@ void get_x11_desktop_info(Display *current_display, Atom atom) {
     /* Set the PropertyChangeMask on the root window, if not set */
     XGetWindowAttributes(display, root, &window_attributes);
     if ((window_attributes.your_event_mask & PropertyChangeMask) == 0) {
-      XSetWindowAttributes attributes;
-      attributes.event_mask =
-          window_attributes.your_event_mask | PropertyChangeMask;
+      XSetWindowAttributes attributes = {
+          .event_mask = window_attributes.your_event_mask | PropertyChangeMask,
+      };
       XChangeWindowAttributes(display, root, CWEventMask, &attributes);
       XGetWindowAttributes(display, root, &window_attributes);
     }
@@ -1352,9 +1407,8 @@ void set_struts() {
     }
   }
 
-  LOG_DEBUG(
-      "reserved space: left={}, right={}, top={}, bottom={}",
-      sizes[0], sizes[1], sizes[2], sizes[3]);
+  LOG_DEBUG("reserved space: left={}, right={}, top={}, bottom={}", sizes[0],
+            sizes[1], sizes[2], sizes[3]);
 
   XChangeProperty(display, window.window, atom, XA_CARDINAL, 32,
                   PropModeReplace, reinterpret_cast<unsigned char *>(&sizes),
@@ -1376,33 +1430,31 @@ void set_struts() {
 }
 #endif /* OWN_WINDOW */
 
+void swap_x11_buffers() {
 #ifdef BUILD_XDBE
-void xdbe_swap_buffers() {
-  if (use_xdbe.get(*state)) {
+  if (use_double_buffer.get(*state)) {
     XdbeSwapInfo swap;
 
     swap.swap_window = window.window;
     swap.swap_action = XdbeBackground;
     XdbeSwapBuffers(display, &swap, 1);
   }
-}
-#else
-void xpmdb_swap_buffers(void) {
-  if (use_xpmdb.get(*state)) {
+#else /* BUILD_XDBE */
+  if (use_double_buffer.get(*state)) {
     XCopyArea(display, window.back_buffer, window.window, window.gc, 0, 0,
               window.geometry.width(), window.geometry.height(), 0, 0);
-    unsigned long bg = 0;
-    if (window.color_depth == argb8888_color_depth) {
-      Colour c = get_background_colour_preference(*state);
-      bg = c.to_x11_color(display, screen, window.opacity < 0xff, true);
-    }
+    Colour c = get_background_colour_preference(*state);
+    unsigned long bg =
+        window.color_depth == argb8888_color_depth
+            ? c.to_x11_color(display, screen, window.opacity < 0xff, true)
+            : c.to_x11_color(display, screen, false, false);
     XSetForeground(display, window.gc, bg);
     XFillRectangle(display, window.drawable, window.gc, 0, 0,
                    window.geometry.width(), window.geometry.height());
     XFlush(display);
   }
-}
 #endif /* BUILD_XDBE */
+}
 
 void print_kdb_led(const int keybit, char *p, unsigned int p_max_size) {
   XKeyboardState x;
@@ -1455,55 +1507,19 @@ void print_mouse_speed(struct text_object *obj, char *p,
   snprintf(p, p_max_size, "%d%%", (110 - threshold));
 }
 
-/// @brief Returns a mask for the event_type
-/// @param event_type Xlib event type
-/// @return Xlib event mask
-int ev_to_mask(int event_type, int button) {
-  switch (event_type) {
-    case KeyPress:
-      return KeyPressMask;
-    case KeyRelease:
-      return KeyReleaseMask;
-    case ButtonPress:
-      return ButtonPressMask;
-    case ButtonRelease:
-      switch (button) {
-        case 1:
-          return ButtonReleaseMask | Button1MotionMask;
-        case 2:
-          return ButtonReleaseMask | Button2MotionMask;
-        case 3:
-          return ButtonReleaseMask | Button3MotionMask;
-        case 4:
-          return ButtonReleaseMask | Button4MotionMask;
-        case 5:
-          return ButtonReleaseMask | Button5MotionMask;
-        default:
-          return ButtonReleaseMask;
-      }
-    case EnterNotify:
-      return EnterWindowMask;
-    case LeaveNotify:
-      return LeaveWindowMask;
-    case MotionNotify:
-      return PointerMotionMask;
-    default:
-      return NoEventMask;
-  }
-}
+void propagate_x11_event(conky::x11::event &event) {
+  if (!event.is_some()) { return; }
 
-void propagate_xinput_event(const conky::xi_event_data *ev) {
-  if (ev->evtype != XI_Motion && ev->evtype != XI_ButtonPress &&
-      ev->evtype != XI_ButtonRelease) {
-    return;
-  }
+  auto xi_event = event.downcast<conky::xi_pointer_event>();
+  if (!xi_event.has_value()) { return; }
+  auto &ev = xi_event->get();
 
   Window target = window.root;
   Window child = None;
-  conky::vec2i target_pos = ev->pos;
+  conky::vec2i target_pos = ev.pos;
   {
     std::vector<Window> below = query_x11_windows_at_pos(
-        display, ev->pos_absolute,
+        display, ev.pos_absolute,
         [](XWindowAttributes &a) { return a.map_state == IsViewable; });
     auto it = std::remove_if(below.begin(), below.end(),
                              [](Window w) { return w == window.window; });
@@ -1513,14 +1529,14 @@ void propagate_xinput_event(const conky::xi_event_data *ev) {
 
       int read_x, read_y;
       // Update event x and y coordinates to be target window relative
-      XTranslateCoordinates(display, window.desktop, ev->event,
-                            ev->pos_absolute.x(), ev->pos_absolute.y(), &read_x,
+      XTranslateCoordinates(display, window.desktop, ev.event,
+                            ev.pos_absolute.x(), ev.pos_absolute.y(), &read_x,
                             &read_y, &child);
       target_pos = conky::vec2i(read_x, read_y);
     }
   }
 
-  auto events = ev->generate_events(target, child, target_pos);
+  auto events = ev.generate_events(target, child, target_pos);
 
   XUngrabPointer(display, CurrentTime);
   for (auto it : events) {
@@ -1530,62 +1546,6 @@ void propagate_xinput_event(const conky::xi_event_data *ev) {
   }
 
   XFlush(display);
-}
-
-void propagate_x11_event(XEvent &ev, const void *cookie) {
-  bool focus = ev.type == ButtonPress;
-
-  // cookie must be allocated before propagation, and freed after
-  if (ev.type == GenericEvent && ev.xgeneric.extension == window.xi_opcode) {
-    if (cookie == nullptr) { return; }
-    return propagate_xinput_event(
-        reinterpret_cast<const conky::xi_event_data *>(cookie));
-  }
-
-  if (!(ev.type == KeyPress || ev.type == KeyRelease ||
-        ev.type == ButtonPress || ev.type == ButtonRelease ||
-        ev.type == MotionNotify || ev.type == EnterNotify ||
-        ev.type == LeaveNotify)) {
-    // Not a known input event; blindly propagating them causes loops and all
-    // sorts of other evil.
-    return;
-  }
-  // Note that using ev.xbutton is the same as using any of the above events.
-  // It's only important we don't access fields that are not common to all of
-  // them.
-
-  ev.xbutton.window = window.desktop;
-  ev.xbutton.x = ev.xbutton.x_root;
-  ev.xbutton.y = ev.xbutton.y_root;
-  ev.xbutton.time = CurrentTime;
-
-  /* forward the event to the window below conky (e.g. caja) or desktop */
-  {
-    std::vector<Window> below = query_x11_windows_at_pos(
-        display, conky::vec2i(ev.xbutton.x_root, ev.xbutton.y_root),
-        [](XWindowAttributes &a) { return a.map_state == IsViewable; });
-    auto it = std::remove_if(below.begin(), below.end(),
-                             [](Window w) { return w == window.window; });
-    below.erase(it, below.end());
-    if (!below.empty()) {
-      ev.xbutton.window = below.back();
-
-      Window _ignore;
-      // Update event x and y coordinates to be target window relative
-      XTranslateCoordinates(display, window.root, ev.xbutton.window,
-                            ev.xbutton.x_root, ev.xbutton.y_root, &ev.xbutton.x,
-                            &ev.xbutton.y, &_ignore);
-    }
-    // drop below vector
-  }
-
-  int mask =
-      ev_to_mask(ev.type, ev.type == ButtonRelease ? ev.xbutton.button : 0);
-  XUngrabPointer(display, CurrentTime);
-  XSendEvent(display, ev.xbutton.window, True, mask, &ev);
-  if (focus) {
-    XSetInputFocus(display, ev.xbutton.window, RevertToParent, CurrentTime);
-  }
 }
 
 Window query_x11_top_parent(Display *display, Window child) {
@@ -1680,10 +1640,10 @@ std::vector<Window> query_x11_windows(Display *display, bool eager) {
   return result;
 }
 
-Window query_x11_window_at_pos(Display *display, conky::vec2i pos, int device_id) {
-  (void) device_id;
+Window query_x11_window_at_pos(Display *display, conky::vec2i pos,
+                               int device_id) {
+  (void)device_id;
   Window root = DefaultVRootWindow(display);
-
 
   Window root_return;
   Window last = None;

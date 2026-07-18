@@ -79,7 +79,7 @@ struct special_node {
   double arg;
   std::vector<double> graph_data;
   size_t data_hash; /* identifies the data source; detects slot reuse */
-  double scale; /* maximum value */
+  double scale;     /* maximum value */
   short show_scale;
   int graph_width;
   int scaled; /* auto adjust maximum */
@@ -107,12 +107,13 @@ struct text_object;
 /* scanning special arguments */
 const char *scan_bar(struct text_object *, const char *, double);
 const char *scan_gauge(struct text_object *, const char *, double);
+std::pair<char *, size_t> scan_command(const char *);
 #ifdef BUILD_GUI
 void scan_font(struct text_object *, const char *);
-std::pair<char *, size_t> scan_command(const char *);
 bool scan_graph(struct text_object *, const char *, double, char,
                 graph_data_key key = graph_parent_obj_key);
 void scan_tab(struct text_object *, const char *);
+void scan_hr(struct text_object *, const char *);
 void scan_stippled_hr(struct text_object *, const char *);
 
 /* printing specials */

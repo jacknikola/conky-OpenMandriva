@@ -28,20 +28,20 @@
  */
 
 #include "exec.h"
-#include <cerrno>
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <string>
 #include "../conky.h"
-#include "../core.h"
-#include "../logging.h"
 #include "../content/specials.h"
 #include "../content/text_object.h"
+#include "../core.h"
+#include "../logging.h"
 #include "../update-cb.hh"
 
 struct exec_data {
@@ -122,8 +122,20 @@ static FILE *pid_popen(const char *command, const char *mode, pid_t *child) {
     close(parentend);
 
     // by dupping childend, the returned fd will have close-on-exec turned off
-    if (fcntl(childend, F_DUPFD, 0) == -1) { LOG_ERROR("failed to dup child fd: {}", strerror(errno)); }
+    if (fcntl(childend, F_DUPFD, 0) == -1) {
+      LOG_ERROR("failed to dup child fd: {}", strerror(errno));
+    }
     close(childend);
+
+    // Discard the command's stderr. We only capture stdout, so without this a
+    // command that chatters on stderr every update interval (e.g. `sensors`
+    // complaining about an unreadable subfeature) would inherit conky's stderr
+    // and flood the terminal or system journal (#1596).
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull != -1) {
+      dup2(devnull, STDERR_FILENO);
+      if (devnull != STDERR_FILENO) { close(devnull); }
+    }
 
     execl("/bin/sh", "sh", "-c", remove_excess_quotes(command),
           (char *)nullptr);
@@ -197,8 +209,14 @@ static void remove_deleted_chars(char *string, unsigned int p_max_size) {
  * @param[in] buf output of a command executed by an exec_cb object
  * @return number between 0.0 and 100.0
  */
-static inline double get_barnum(const char *buf) {
+double get_barnum(const char *buf) {
   double barnum;
+
+  /* The exec callback may not have produced output yet (e.g. when the
+   * text object is newly created via conky_parse inside a Lua script).
+   * Return 0.0 silently — this mirrors how print_exec/fill_p handles
+   * the same transient condition (#1699). */
+  if (buf == nullptr || buf[0] == '\0') { return 0.0; }
 
   if (sscanf(buf, "%lf", &barnum) != 1) {
     LOG_ERROR(
@@ -299,7 +317,8 @@ void scan_exec_arg(struct text_object *obj, const char *arg, exec_flag flags) {
                               : graph_parent_obj_key);
     cmd = buf;
     if (cmd == nullptr) {
-      LOG_ERROR("error parsing execgraph arguments: '{}'", arg ? arg : "(null)");
+      LOG_ERROR("error parsing execgraph arguments: '{}'",
+                arg ? arg : "(null)");
     }
 #endif /* BUILD_GUI */
   }

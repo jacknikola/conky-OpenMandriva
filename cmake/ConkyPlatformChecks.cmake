@@ -22,6 +22,8 @@ include(FindPkgConfig)
 include(CheckFunctionExists)
 include(CheckIncludeFiles)
 include(CheckSymbolExists)
+include(CheckLibraryExists)
+include(FetchContent)
 
 # Check for some headers
 check_include_files(sys/statfs.h HAVE_SYS_STATFS_H)
@@ -41,15 +43,15 @@ else(CMAKE_SYSTEM_NAME MATCHES "Darwin")
   check_symbol_exists(statfs64 "sys/statfs.h" HAVE_STATFS64)
 endif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
 
-ac_search_libs(clock_gettime "time.h" CLOCK_GETTIME_LIB "rt")
-
-if(NOT DEFINED CLOCK_GETTIME_LIB)
-  if(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
+check_symbol_exists(clock_gettime "time.h" HAVE_CLOCK_GETTIME)
+if(NOT HAVE_CLOCK_GETTIME)
+  check_library_exists(rt clock_gettime "" HAVE_CLOCK_GETTIME_RT)
+  if(HAVE_CLOCK_GETTIME_RT)
+    set(CLOCK_GETTIME_LIB rt)
+  elseif(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
     message(FATAL_ERROR "clock_gettime not found.")
-  endif(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
-else(NOT DEFINED CLOCK_GETTIME_LIB)
-  set(HAVE_CLOCK_GETTIME 1)
-endif(NOT DEFINED CLOCK_GETTIME_LIB)
+  endif()
+endif()
 
 set(conky_libs ${conky_libs} ${CLOCK_GETTIME_LIB})
 
@@ -732,9 +734,10 @@ if(BUILD_LUA_CAIRO)
     pkg_check_modules(CAIROXLIB REQUIRED cairo-xlib)
     set(luacairo_libs ${CAIROXLIB_LINK_LIBRARIES} ${luacairo_libs})
     set(luacairo_includes ${CAIROXLIB_INCLUDE_DIRS} ${luacairo_includes})
-    set(conky_libs ${conky_libs} ${luacairo_libs})
-    set(conky_includes ${conky_includes} ${luacairo_includes})
   endif(BUILD_LUA_CAIRO_XLIB)
+
+  set(conky_libs ${conky_libs} ${luacairo_libs})
+  set(conky_includes ${conky_includes} ${luacairo_includes})
 
   find_program(APP_PATCH patch)
 
@@ -811,6 +814,11 @@ if(BUILD_NVIDIA)
     message(FATAL_ERROR "Unable to find XNVCtrl library")
   endif(XNVCtrl_INCLUDE_PATH AND XNVCtrl_LIB)
 endif(BUILD_NVIDIA)
+
+if(BUILD_NVIDIA_NVML)
+  # Supported architectures are enforced by 3rdparty/nvml/CMakeLists.txt, which
+  # picks the matching prebuilt stub.
+endif(BUILD_NVIDIA_NVML)
 
 if(BUILD_IMLIB2)
   pkg_search_module(IMLIB2 REQUIRED imlib2 Imlib2)

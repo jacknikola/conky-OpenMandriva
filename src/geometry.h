@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -362,6 +363,46 @@ struct vec {
   operator std::array<T, Length>() const { return this->to_array(); }
 };
 
+/// @brief Component-wise `Vc::floor` of a floating-point vector.
+///
+/// Uses Vc's SIMD `floor` rather than the scalar `std::floor`. The vec storage
+/// is a `Vc::array` (no SIMD math), so the values are routed through a
+/// `Vc::SimdArray` for the operation.
+template <std::floating_point T, size_t Length>
+inline vec<T, Length> floor(const vec<T, Length> &v) {
+  std::array<T, Length> data = v.to_array();
+  Vc::SimdArray<T, Length> simd(data.data(), Vc::Unaligned);
+  Vc::floor(simd).store(data.data(), Vc::Unaligned);
+  return vec<T, Length>(data);
+}
+
+/// @brief No-op `floor` for integral vectors; they are already whole numbers.
+template <typename T, size_t Length>
+  requires(!std::floating_point<T>)
+inline vec<T, Length> floor(const vec<T, Length> &v) {
+  return v;
+}
+
+/// @brief Component-wise `Vc::ceil` of a floating-point vector.
+///
+/// Uses Vc's SIMD `ceil` rather than the scalar `std::ceil`. The vec storage is
+/// a `Vc::array` (no SIMD math), so the values are routed through a
+/// `Vc::SimdArray` for the operation.
+template <std::floating_point T, size_t Length>
+inline vec<T, Length> ceil(const vec<T, Length> &v) {
+  std::array<T, Length> data = v.to_array();
+  Vc::SimdArray<T, Length> simd(data.data(), Vc::Unaligned);
+  Vc::ceil(simd).store(data.data(), Vc::Unaligned);
+  return vec<T, Length>(data);
+}
+
+/// @brief No-op `ceil` for integral vectors; they are already whole numbers.
+template <typename T, size_t Length>
+  requires(!std::floating_point<T>)
+inline vec<T, Length> ceil(const vec<T, Length> &v) {
+  return v;
+}
+
 template <typename T>
 using vec2 = vec<T, 2>;
 using vec2f = vec2<float>;
@@ -432,15 +473,11 @@ struct rect {
 
   /// @brief Rectangle width.
   /// @return width of this rectangle.
-  inline T width() const {
-    return size().x();
-  }
+  inline T width() const { return size().x(); }
 
   /// @brief Rectangle height.
   /// @return height of this rectangle.
-  inline T height() const {
-    return size().y();
-  }
+  inline T height() const { return size().y(); }
 
   /// @brief Returns rectangle component at `index`.
   /// @param index component index.
@@ -663,8 +700,8 @@ struct fmt::formatter<conky::vec<T, Length>> : fmt::formatter<T> {
 template <typename T, conky::rect_kind Kind>
 struct fmt::formatter<conky::rect<T, Kind>> : fmt::formatter<T> {
   auto format(const conky::rect<T, Kind> &r, fmt::format_context &ctx) const {
-    return fmt::format_to(ctx.out(), "rect({}x{} @ {}, {})",
-                          r.width(), r.height(), r.x(), r.y());
+    return fmt::format_to(ctx.out(), "rect({}x{} @ {}, {})", r.width(),
+                          r.height(), r.x(), r.y());
   }
 };
 

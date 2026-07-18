@@ -75,7 +75,7 @@ enum class exec_flag : unsigned int {
 
 inline exec_flag operator|(exec_flag a, exec_flag b) {
   return static_cast<exec_flag>(static_cast<unsigned>(a) |
-                                    static_cast<unsigned>(b));
+                                static_cast<unsigned>(b));
 }
 
 inline bool operator&(exec_flag a, exec_flag b) {
@@ -88,5 +88,6 @@ void register_exec(struct text_object *);
 void print_exec(struct text_object *, char *, unsigned int);
 double execbarval(struct text_object *);
 void free_exec(struct text_object *);
+double get_barnum(const char *buf);
 
 #endif /* _EXEC_H */

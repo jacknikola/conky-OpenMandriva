@@ -30,6 +30,7 @@
 #include "display-http.hh"
 
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 
@@ -51,7 +52,15 @@ void register_output<output_t::HTTP>(display_outputs_t &outputs) {
 /* older API */
 #define MHD_Result int
 #endif /* MHD_YES */
-std::string webpage;
+/* `presented` is the page served to clients: read by libmicrohttpd's worker
+ * thread in sendanswer() and published by the draw thread in end_draw_text(),
+ * so every access must hold builder_mutex. The draw thread assembles into
+ * `webpage` (which it alone touches) and swaps it in under the lock; this way
+ * a request never observes a half-built page or races std::string's buffer
+ * management, which previously corrupted the heap and hung the process. */
+std::mutex builder_mutex;
+std::string presented;
+static std::string webpage;
 struct MHD_Daemon *httpd;
 static conky::simple_config_setting<bool> http_refresh("http_refresh", false,
                                                        true);
@@ -62,8 +71,15 @@ MHD_Result sendanswer(void *cls, struct MHD_Connection *connection,
                       const char *url, const char *method, const char *version,
                       const char *upload_data, size_t *upload_data_size,
                       void **con_cls) {
-  struct MHD_Response *response = MHD_create_response_from_buffer(
-      webpage.length(), (void *)webpage.c_str(), MHD_RESPMEM_PERSISTENT);
+  struct MHD_Response *response;
+  {
+    /* Copy the page out under the lock; MHD_RESPMEM_MUST_COPY snapshots the
+     * bytes so we don't hand MHD a pointer into a string the draw thread may
+     * reallocate. */
+    std::lock_guard<std::mutex> lock(builder_mutex);
+    response = MHD_create_response_from_buffer(
+        presented.length(), (void *)presented.c_str(), MHD_RESPMEM_MUST_COPY);
+  }
   MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
   MHD_destroy_response(response);
   if (cls || url || method || version || upload_data || upload_data_size ||
@@ -71,45 +87,8 @@ MHD_Result sendanswer(void *cls, struct MHD_Connection *connection,
   return ret;
 }
 
-class out_to_http_setting : public conky::simple_config_setting<bool> {
-  typedef conky::simple_config_setting<bool> Base;
-
- protected:
-  virtual void lua_setter(lua::state &l, bool init) {
-    lua::stack_sentry s(l, -2);
-
-    Base::lua_setter(l, init);
-
-    if (init && do_convert(l, -1).first) {
-      /* warn about old default port */
-      if (http_port.get(*state) == 10080) {
-        LOG_WARNING(
-            "port {} is blocked by browsers like Firefox and Chromium, "
-            "you may want to change http_port", http_port.get(*state));
-      }
-      httpd =
-          MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, http_port.get(*state),
-                           nullptr, NULL, &sendanswer, nullptr, MHD_OPTION_END);
-    }
-
-    ++s;
-  }
-
-  virtual void cleanup(lua::state &l) {
-    lua::stack_sentry s(l, -1);
-
-    if (do_convert(l, -1).first) {
-      MHD_stop_daemon(httpd);
-      httpd = nullptr;
-    }
-
-    l.pop();
-  }
-
- public:
-  out_to_http_setting() : Base("out_to_http", false, false) {}
-};
-static out_to_http_setting out_to_http;
+static conky::simple_config_setting<bool> out_to_http("out_to_http", false,
+                                                      false);
 
 std::string string_replace_all(std::string original, const std::string &oldpart,
                                const std::string &newpart,
@@ -161,7 +140,7 @@ display_output_http::display_output_http() : display_output_base("http") {
 }
 
 bool display_output_http::detect() {
-  if (/*priv::*/ out_to_http.get(*state)) {
+  if (out_to_http.get(*state)) {
     LOG_DEBUG("display output '{}' enabled in config", name);
     return true;
   }
@@ -169,14 +148,29 @@ bool display_output_http::detect() {
 }
 
 bool display_output_http::initialize() {
-  if (/*priv::*/ out_to_http.get(*state)) {
-    is_active = true;
-    return true;
+  if (!out_to_http.get(*state)) { return false; }
+
+  /* warn about old default port */
+  if (http_port.get(*state) == 10080) {
+    LOG_WARNING(
+        "port {} is blocked by browsers like Firefox and Chromium, "
+        "you may want to change http_port",
+        http_port.get(*state));
   }
-  return false;
+  httpd = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, http_port.get(*state),
+                           nullptr, NULL, &sendanswer, nullptr, MHD_OPTION_END);
+
+  is_active = true;
+  return true;
 }
 
-bool display_output_http::shutdown() { return true; }
+bool display_output_http::shutdown() {
+  if (httpd != nullptr) {
+    MHD_stop_daemon(httpd);
+    httpd = nullptr;
+  }
+  return true;
+}
 
 void display_output_http::begin_draw_text() {
 #define WEBPAGE_START1                                             \
@@ -200,7 +194,12 @@ void display_output_http::begin_draw_text() {
   }
 }
 
-void display_output_http::end_draw_text() { webpage.append(WEBPAGE_END); }
+void display_output_http::end_draw_text() {
+  webpage.append(WEBPAGE_END);
+  /* Publish the freshly built page for the HTTP worker thread to serve. */
+  std::lock_guard<std::mutex> lock(builder_mutex);
+  presented.swap(webpage);
+}
 
 void display_output_http::draw_string(const char *s, int) {
   std::string::size_type origlen = webpage.length();

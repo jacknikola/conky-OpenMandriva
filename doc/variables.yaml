@@ -799,9 +799,12 @@ values:
       - lines
       - (next_check)
   - name: hr
-    desc: Horizontal line, height is the height in pixels.
+    desc: |-
+      Horizontal line, height is the height in pixels. width can be used to
+      set the width, in pixels, of the horizontal line.
     args:
       - (height)
+      - (width)
   - name: hwmon
     desc: |-
       Hwmon sensor from sysfs (Linux 2.6). Parameter dev can be:
@@ -823,6 +826,21 @@ values:
       - (factor offset)
     other:
       filename: null
+  - name: hwmonbar
+    desc: |-
+      Same as hwmon, but displays the sensor reading as a horizontal bar. Use
+      factor and offset to scale the value reported by hwmon into the 0-100
+      range. Temperature values are already converted from millidegrees. Height
+      and width default to default_bar_height and default_bar_width
+      respectively.
+    args:
+      - (height),(width)
+      - (dev)
+      - type
+      - n
+      - (factor offset)
+    other:
+      filename: null
   - name: i2c
     desc: |-
       I2C sensor from sysfs (Linux 2.6). Parameter dev may be omitted if you have
@@ -834,6 +852,20 @@ values:
       they have to be given as decimal values (i.e. contain at least one decimal
       place).
     args:
+      - (dev)
+      - type
+      - n
+      - (factor offset)
+    other:
+      filename: null
+  - name: i2cbar
+    desc: |-
+      Same as i2c, but displays the sensor reading as a horizontal bar. Use
+      factor and offset to scale the value reported by i2c into the 0-100 range.
+      Temperature values are already converted from millidegrees. Height and
+      width default to default_bar_height and default_bar_width respectively.
+    args:
+      - (height),(width)
       - (dev)
       - type
       - n
@@ -1508,7 +1540,7 @@ values:
     desc: Short hostname (same as 'hostname -s' shell command).
   - name: nvidia
     desc: |-
-      Nvidia graphics card information via the XNVCtrl library.
+      Nvidia graphics card information via the XNVCtrl library or the NVML library.
 
       Temperatures are printed as float, all other values as integers.
 
@@ -1517,37 +1549,45 @@ values:
 
       **Possible arguments:**
 
-      | Argument           | Alias       | Description                                                     |
-      |--------------------|-------------|-----------------------------------------------------------------|
-      | `gputemp`          | `temp`      | GPU temperature                                                 |
-      | `gputempthreshold` | `threshold` | Temperature threshold where the GPU will reduce its clock speed |
-      | `ambienttemp`      | `ambient`   | Ambient temperature outside the graphics card                   |
-      | `gpufreqcur`       | `gpufreq`   | Current GPU clock speed                                         |
-      | `gpufreqmin`       |             | Minimum GPU clock speed                                         |
-      | `gpufreqmax`       |             | Maximum GPU clock speed                                         |
-      | `memfreqcur`       | `memfreq`   | Current memory clock speed                                      |
-      | `memfreqmin`       |             | Minimum memory clock speed                                      |
-      | `memfreqmax`       |             | Maximum memory clock speed                                      |
-      | `mtrfreqcur`       | `mtrfreq`   | Current memory transfer rate clock speed                        |
-      | `mtrfreqmin`       |             | Minimum memory transfer rate clock speed                        |
-      | `mtrfreqmax`       |             | Maximum memory transfer rate clock speed                        |
-      | `perflevelcur`     | `perflevel` | Current performance level                                       |
-      | `perflevelmin`     |             | Lowest performance level                                        |
-      | `perflevelmax`     |             | Highest performance level                                       |
-      | `perfmode`         |             | Performance mode                                                |
-      | `gpuutil`          |             | GPU utilization %                                               |
-      | `membwutil`        |             | Memory bandwidth utilization %                                  |
-      | `videoutil`        |             | Video engine utilization %                                      |
-      | `pcieutil`         |             | PCIe bandwidth utilization %                                    |
-      | `memused`          | `mem`       | Amount of used memory                                           |
-      | `memfree`          | `memavail`  | Amount of free memory                                           |
-      | `memmax`           | `memtotal`  | Total amount of memory                                          |
-      | `memutil`          | `memperc`   | Memory utilization %                                            |
-      | `fanspeed`         |             | Fan speed                                                       |
-      | `fanlevel`         |             | Fan level %                                                     |
-      | `imagequality`     |             | Image quality                                                   |
-      | `modelname`        |             | Model name of the GPU card                                      |
-      | `driverversion`    |             | Driver version                                                  |
+      | Argument           | Alias       | Description                                                     | XNVCtrl | NVML |
+      |--------------------|-------------|-----------------------------------------------------------------|---------|------|
+      | `gputemp`          | `temp`      | GPU temperature                                                 | ✅      | ✅   |
+      | `gputempthreshold` | `threshold` | Temperature threshold where the GPU will reduce its clock speed | ✅      | ✅   |
+      | `ambienttemp`      | `ambient`   | Ambient temperature outside the graphics card                   | ✅      | ❌   |
+      | `gpufreqcur`       | `gpufreq`   | Current GPU clock speed                                         | ✅      | ✅   |
+      | `gpufreqmin`       |             | Minimum GPU clock speed                                         | ✅      | ✅   |
+      | `gpufreqmax`       |             | Maximum GPU clock speed                                         | ✅      | ✅   |
+      | `memfreqcur`       | `memfreq`   | Current memory clock speed                                      | ✅      | ✅   |
+      | `memfreqmin`       |             | Minimum memory clock speed                                      | ✅      | ✅   |
+      | `memfreqmax`       |             | Maximum memory clock speed                                      | ✅      | ✅   |
+      | `mtrfreqcur`       | `mtrfreq`   | Current memory transfer rate clock speed                        | ✅      | ❌   |
+      | `mtrfreqmin`       |             | Minimum memory transfer rate clock speed                        | ✅      | ❌   |
+      | `mtrfreqmax`       |             | Maximum memory transfer rate clock speed                        | ✅      | ❌   |
+      | `perflevelcur`     | `perflevel` | Current performance level                                       | ✅      | ✅   |
+      | `perflevelmin`     |             | Lowest performance level                                        | ✅      | ✅   |
+      | `perflevelmax`     |             | Highest performance level                                       | ✅      | ✅   |
+      | `perfmode`         |             | Performance mode                                                | ✅      | ❌   |
+      | `gpuutil`          |             | GPU utilization %                                               | ✅      | ✅   |
+      | `membwutil`        |             | Memory bandwidth utilization %                                  | ✅      | ❌   |
+      | `videoutil`        |             | Video engine utilization %                                      | ✅      | ❌   |
+      | `videodecutil`     |             | Video decoder utilization %                                     | ❌      | ✅   |
+      | `videoencutil`     |             | Video encoder utilization %                                     | ❌      | ✅   |
+      | `pcieutil`         |             | PCIe bandwidth utilization %                                    | ✅      | ❌   |
+      | `pciethroughputtx` |             | Data sent from the GPU (transmit) per second                    | ❌      | ✅   |
+      | `pciethroughputrx` |             | Data received by the GPU (receive) per second                   | ❌      | ✅   |
+      | `memused`          | `mem`       | Amount of used memory                                           | ✅      | ✅   |
+      | `memfree`          | `memavail`  | Amount of free memory                                           | ✅      | ✅   |
+      | `memmax`           | `memtotal`  | Total amount of memory                                          | ✅      | ✅   |
+      | `memutil`          | `memperc`   | Memory utilization %                                            | ✅      | ✅   |
+      | `fanspeed`         |             | Fan speed                                                       | ✅      | ✅   |
+      | `fanlevel`         |             | Fan level %                                                     | ✅      | ✅   |
+      | `imagequality`     |             | Image quality                                                   | ✅      | ❌   |
+      | `modelname`        |             | Model name of the GPU card                                      | ✅      | ✅   |
+      | `driverversion`    |             | Driver version                                                  | ✅      | ✅   |
+      | `arch      `       |             | GPU architecture name                                           | ❌      | ✅   |
+      | `powerlimit`       |             | Power limit in Watts                                            | ❌      | ✅   |
+      | `powerinstant`     |             | Power usage in Watts                                            | ❌      | ✅   |
+      | `poweravg`         |             | Power usage averaged over one second in Watts                   | ❌      | ✅   |
     args:
       - argument
       - (GPU_ID)
@@ -1575,6 +1615,9 @@ values:
       * `perfmode`
       * `memtotal` (`memmax`)
       * `fanspeed`
+      * `powerlimit`
+      * `pciethroughputtx`
+      * `pciethroughputrx`
     args:
       - (height),(width)
       - argument
@@ -1845,6 +1888,21 @@ values:
       - type
       - n
       - (factor offset)
+  - name: platformbar
+    desc: |-
+      Same as platform, but displays the sensor reading as a horizontal bar. Use
+      factor and offset to scale the value reported by platform into the 0-100
+      range. Temperature values are already converted from millidegrees. Height
+      and width default to default_bar_height and default_bar_width
+      respectively.
+    args:
+      - (height),(width)
+      - (dev)
+      - type
+      - n
+      - (factor offset)
+    other:
+      filename: null
   - name: pop3_unseen
     desc: |-
       Displays the number of unseen messages in your global POP3
@@ -2040,6 +2098,8 @@ values:
     desc: Stippled (dashed) horizontal line.
     args:
       - (space)
+      - (height)
+      - (width)
   - name: stock
     desc: |-
       Displays the data of a stock symbol. The following data is
@@ -2497,8 +2557,8 @@ values:
   - name: wireless_link_bar
     desc: Wireless link quality bar. Linux only.
     args:
-      - (height),(width)
       - (net)
+      - (height),(width)
   - name: wireless_link_qual
     desc: Wireless link quality. Linux only.
     args:

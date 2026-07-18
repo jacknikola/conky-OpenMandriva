@@ -52,10 +52,20 @@ endif(NOT CMAKE_BUILD_TYPE)
 
 # -std options for all build types
 set(CMAKE_C_STANDARD 99)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_COMPILE_WARNING_AS_ERROR ${MAINTAINER_MODE})
+
+# In maintainer builds, reject compiler-specific language extensions. Setting
+# CMAKE_CXX_EXTENSIONS=OFF above only selects the ISO -std=c++NN dialect over
+# gnu++NN; -Wpedantic additionally diagnoses any use of extensions in the
+# sources. Combined with CMAKE_COMPILE_WARNING_AS_ERROR this makes extension
+# usage a hard error (generated toluapp code is exempted in ToLua.cmake via
+# -Wno-error=pedantic).
+if(MAINTAINER_MODE)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>)
+endif()
 
 if(NOT OS_OPENBSD)
   # Always use libc++ when compiling w/ clang
@@ -141,14 +151,17 @@ cmake_dependent_option(BUILD_HDDTEMP "Support for hddtemp" true
 cmake_dependent_option(BUILD_IPV6 "Enable if you want IPv6 support" true
   "OS_LINUX" false)
 
+cmake_dependent_option(BUILD_NVIDIA_NVML "Enable Nvidia variables with NVML" false
+  "OS_LINUX" false)
+
 if(OS_LINUX)
   # nvidia may also work on FreeBSD, not sure
   # NvCtrl requires X11. Should be modified to use NVML directly.
-  dependent_option(BUILD_NVIDIA "Enable Nvidia NvCtrl variables" false
-    "BUILD_X11" false
+  dependent_option(BUILD_NVIDIA "Enable Nvidia variables with NvCtrl" false
+    "BUILD_X11 AND (NOT BUILD_NVIDIA_NVML)" false
     "Nvidia NvCtrl variables require X11")
 else()
-  set(BUILD_NVIDIA false CACHE BOOL "Enable Nvidia NvCtrl variables" FORCE)
+  set(BUILD_NVIDIA false CACHE BOOL "Enable Nvidia variables with NvCtrl" FORCE)
 endif(OS_LINUX)
 
 # macOS Only

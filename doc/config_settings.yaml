@@ -427,7 +427,7 @@ values:
       - color
   - name: own_window_hints
     desc: |-
-      If [`own_window`](#own_window) is set, on X11 you may specify comma separated window
+      If [`own_window`](#own_window) is set, you may specify comma separated window
       manager hints to affect the way Conky displays.
 
       Following hints are some of the standard WM specification ones:
@@ -446,6 +446,14 @@ values:
       Notes:
       - Use `own_window_type='desktop'` setting as another way to implement many of these hints implicitly.
       - If you use `own_window_type='override'`, window manager hints have no meaning and are ignored.
+      - Under Wayland these hints are translated to a wlr-layer-shell placement
+        (the compositor must support that protocol). A `normal` or `utility`
+        window that would otherwise be a regular toplevel is instead mounted as
+        a layer surface when any of `below`, `above` or `sticky` is set:
+        `below`/`above` pick the bottom/top layer, while `sticky` (shown across
+        all workspaces), `skip_taskbar` and `skip_pager` are intrinsic to layer
+        surfaces. `undecorated` is implicit since layer surfaces are never
+        decorated.
     args:
       - hint(,hint)*
   - name: own_window_title
@@ -454,8 +462,10 @@ values:
     default: 'conky (<hostname>)'
   - name: own_window_type
     desc: |-
-      If `own_window` is set, under X11 you can specify type of window conky
-      displayed as:
+      Specifies the type of window conky is displayed as. Under X11 this
+      requires `own_window` to be set; under Wayland it selects the
+      wlr-layer-shell layer the surface is mounted on (and, for `dock`/`panel`,
+      whether it reserves screen space via an exclusive zone). Available types:
 
       - `normal` mode makes conky show as normal window. This mode can be
         configured with use of [`own_window_hints`](#own_window_hints) setting.
@@ -475,7 +485,9 @@ values:
         position and size, and workarea dimensions, to ensure normal windows
         have most free space available. For WMs that "cut out" entirely covered
         screens from reserved area, the edge will be chosen based on `alignment`
-        setting.
+        setting. Under Wayland the reserved edge is always derived from
+        `alignment`; a fully centered (`mm`) alignment has no edge to reserve
+        against, so use an edge-aligned value (e.g. `tm`, `bm`, `ml`, `mr`).
       - `utility` windows are persistent utility windows (e.g. a palette or
         toolbox). They appear on top of other windows (in the same group), but
         otherwise behave much like `normal` windows.

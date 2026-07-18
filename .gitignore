@@ -25,6 +25,10 @@ data/defconfig.h
 /build.h
 src/colour-names.hh
 
+# Don't ignore NVML library
+!3rdparty/nvml/**/lib/*.so
+!3rdparty/nvml/**/lib/*.a
+
 # Compiler cache
 .cache
 
@@ -47,3 +51,4 @@ src/colour-names.hh
 
 # Built manual
 /conky.1.gz
+.codex/

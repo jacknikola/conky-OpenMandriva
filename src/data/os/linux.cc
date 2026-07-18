@@ -35,11 +35,11 @@
 #include <clocale>
 #include "../../common.h"
 #include "../../conky.h"
-#include "../hardware/diskio.h"
+#include "../../content/temphelper.h"
 #include "../../logging.h"
+#include "../hardware/diskio.h"
 #include "../network/net_stat.h"
 #include "../proc.h"
-#include "../../content/temphelper.h"
 #ifndef HAVE_CLOCK_GETTIME
 #include <sys/time.h>
 #endif
@@ -47,7 +47,9 @@
 #include <unistd.h>
 // #include <assert.h>
 #include <time.h>
+#include <algorithm>
 #include <unordered_map>
+#include <vector>
 #include "../../lua/setting.hh"
 #include "../top.h"
 
@@ -923,6 +925,18 @@ void determine_longstat_file(void) {
   stat_initialized = 1;
 }
 
+// Kernel CPU numbers that are present (populated), in ascending order as
+// reported by /sys/devices/system/cpu/present. Used to map a "cpuN" line from
+// /proc/stat to its slot in the cpu[]/info.cpu_usage arrays (slot 0 is the
+// aggregate, present cores occupy slots 1..cpu_count in this order).
+static std::vector<int> presented_cpus;
+
+int cpu_present_slot(const std::vector<int> &present, int cpu_number) {
+  auto it = std::lower_bound(present.begin(), present.end(), cpu_number);
+  if (it == present.end() || *it != cpu_number) { return -1; }
+  return static_cast<int>(it - present.begin()) + 1;
+}
+
 void get_cpu_count(void) {
   FILE *stat_fp;
   static int reported = 0;
@@ -938,7 +952,7 @@ void get_cpu_count(void) {
     return;
   }
 
-  info.cpu_count = 0;
+  presented_cpus.clear();
 
   while (!feof(stat_fp)) {
     if (fgets(buf, 255, stat_fp) == nullptr) { break; }
@@ -951,7 +965,6 @@ void get_cpu_count(void) {
     for (str1 = buf;; str1 = nullptr) {
       token = strtok_r(str1, ",", &saveptr1);
       if (token == nullptr) break;
-      ++info.cpu_count;
 
       subtoken1 = -1;
       subtoken2 = -1;
@@ -963,9 +976,14 @@ void get_cpu_count(void) {
         else
           subtoken2 = strtol(subtoken, nullptr, 10);
       }
-      if (subtoken2 > 0) info.cpu_count += subtoken2 - subtoken1;
+      if (subtoken1 < 0) continue;
+      if (subtoken2 < 0) subtoken2 = subtoken1;
+      for (int core = subtoken1; core <= subtoken2; core++) {
+        presented_cpus.push_back(core);
+      }
     }
   }
+  info.cpu_count = static_cast<unsigned int>(presented_cpus.size());
   info.cpu_usage = (float *)malloc((info.cpu_count + 1) * sizeof(float));
 
   fclose(stat_fp);
@@ -1030,6 +1048,13 @@ int update_stat(void) {
     return 0;
   }
 
+  /* Reset per-core usage so that cores which are currently offline (and thus
+   * absent from /proc/stat) report 0 instead of their last, now-stale value.
+   * The aggregate (slot 0) is always present and recomputed below. */
+  for (unsigned int c = 1; c <= info.cpu_count; c++) {
+    info.cpu_usage[c] = 0.0;
+  }
+
   idx = 0;
   while (!feof(stat_fp)) {
     if (fgets(buf, 255, stat_fp) == nullptr) { break; }
@@ -1039,7 +1064,12 @@ int update_stat(void) {
     } else if (strncmp(buf, "cpu", 3) == 0) {
       double delta;
       if (isdigit((unsigned char)buf[3])) {
-        idx++;  // just increment here since the CPU index can skip numbers
+        // Index by the kernel CPU number's position in the present set rather
+        // than a running counter, so offline cores (missing from /proc/stat)
+        // don't shift the remaining cores into the wrong slots.
+        int slot = cpu_present_slot(presented_cpus, atoi(buf + 3));
+        if (slot < 0) { continue; }
+        idx = static_cast<unsigned int>(slot);
       } else {
         idx = 0;
       }
@@ -1092,18 +1122,11 @@ int update_running_processes(void) {
 }
 
 int update_cpu_usage(void) {
-  struct timespec tc = {0L, 100L * 1000000L};
-  update_stat();
-  if (-1 == (nanosleep(&tc, NULL))) {
-    LOG_ERROR("cpu usage sampling sleep interrupted");
-    return 0;
-  }
   update_stat();
   return 0;
 }
 
-void free_cpu(struct text_object *) { /* no-op */
-}
+void free_cpu(struct text_object *) { /* no-op */ }
 
 // fscanf() that reads floats with points even if you are using a locale where
 // floats are with commas
@@ -1455,7 +1478,7 @@ static void parse_sysfs_sensor(struct text_object *obj, const char *arg,
     return;
   }
   LOG_DEBUG("parsed {} args: '{}' '{}' {} {} {}", type, buf1, buf2, n, factor,
-       offset);
+            offset);
   sf = (struct sysfs *)malloc(sizeof(struct sysfs));
   memset(sf, 0, sizeof(struct sysfs));
   sf->fd = open_sysfs_sensor(path, (*buf1) ? buf1 : 0, buf2, n, &sf->arg,
@@ -1466,8 +1489,30 @@ static void parse_sysfs_sensor(struct text_object *obj, const char *arg,
   obj->data.opaque = sf;
 }
 
+static bool is_sysfs_sensor_type(const char *type) {
+  return strcmp(type, "fan") == 0 || strcmp(type, "in") == 0 ||
+         strcmp(type, "temp") == 0 || strcmp(type, "temp2") == 0 ||
+         strcmp(type, "tempf") == 0 || strcmp(type, "vol") == 0;
+}
+
+static const char *scan_sysfs_bar(struct text_object *obj, const char *arg) {
+  char maybe_dev[64], maybe_type[64];
+
+  if (arg != nullptr && sscanf(arg, " %63s %63s", maybe_dev, maybe_type) == 2 &&
+      is_sysfs_sensor_type(maybe_type)) {
+    scan_bar(obj, nullptr, 100);
+    return arg;
+  }
+
+  return scan_bar(obj, arg, 100);
+}
+
 #define PARSER_GENERATOR(name, path)                                     \
   void parse_##name##_sensor(struct text_object *obj, const char *arg) { \
+    parse_sysfs_sensor(obj, arg, path, #name);                           \
+  }                                                                      \
+  void parse_##name##_bar(struct text_object *obj, const char *arg) {    \
+    arg = scan_sysfs_bar(obj, arg);                                      \
     parse_sysfs_sensor(obj, arg, path, #name);                           \
   }
 
@@ -1495,6 +1540,22 @@ void print_sysfs_sensor(struct text_object *obj, char *p,
   } else {
     snprintf(p, p_max_size, "%.1f", r);
   }
+}
+
+double sysfs_sensor_barval(struct text_object *obj) {
+  double r;
+  struct sysfs *sf = (struct sysfs *)obj->data.opaque;
+
+  if (!sf || sf->fd < 0) return 0.0;
+
+  r = get_sysfs_info(&sf->fd, sf->arg, sf->devtype, sf->type);
+
+  r = r * sf->factor + sf->offset;
+
+  if (r < 0.0 || r > 100.0) {
+    LOG_WARNING("sysfs bar value {} out of [0, 100]; adjust factor/offset", r);
+  }
+  return std::clamp(r, 0.0, 100.0);
 }
 
 void free_sysfs_sensor(struct text_object *obj) {
@@ -1546,7 +1607,8 @@ char get_freq(char *p_client_buffer, size_t client_buffer_size,
   // open the CPU information file
   f = open_file("/proc/cpuinfo", &reported);
   if (!f) {
-    LOG_ERROR("failed to access '/proc/cpuinfo' at get_freq: {}", strerror(errno));
+    LOG_ERROR("failed to access '/proc/cpuinfo' at get_freq: {}",
+              strerror(errno));
     return 0;
   }
 
@@ -1654,7 +1716,8 @@ static char get_voltage(char *p_client_buffer, size_t client_buffer_size,
     }
     fclose(f);
   } else {
-    LOG_ERROR("failed to access '{}' at get_voltage: {}", current_freq_file, strerror(errno));
+    LOG_ERROR("failed to access '{}' at get_voltage: {}", current_freq_file,
+              strerror(errno));
     return 0;
   }
 
@@ -1674,7 +1737,8 @@ static char get_voltage(char *p_client_buffer, size_t client_buffer_size,
     }
     fclose(f);
   } else {
-    LOG_ERROR("failed to access '{}' at get_voltage: {}", current_freq_file, strerror(errno));
+    LOG_ERROR("failed to access '{}' at get_voltage: {}", current_freq_file,
+              strerror(errno));
     return 0;
   }
   snprintf(p_client_buffer, client_buffer_size, p_format,
@@ -1719,7 +1783,8 @@ void get_acpi_fan(char *p_client_buffer, size_t client_buffer_size) {
     return;
   }
   memset(buf, 0, sizeof(buf));
-  if (fscanf(fp, "%*s %99s", buf) <= 0) LOG_ERROR("fscanf: {}", strerror(errno));
+  if (fscanf(fp, "%*s %99s", buf) <= 0)
+    LOG_ERROR("fscanf: {}", strerror(errno));
   fclose(fp);
 
   snprintf(p_client_buffer, client_buffer_size, "%s", buf);
@@ -1797,7 +1862,8 @@ void get_acpi_ac_adapter(char *p_client_buffer, size_t client_buffer_size,
       return;
     }
     memset(buf, 0, sizeof(buf));
-    if (fscanf(fp, "%*s %99s", buf) <= 0) LOG_ERROR("fscanf: {}", strerror(errno));
+    if (fscanf(fp, "%*s %99s", buf) <= 0)
+      LOG_ERROR("fscanf: {}", strerror(errno));
     fclose(fp);
 
     snprintf(p_client_buffer, client_buffer_size, "%s", buf);
@@ -2380,24 +2446,20 @@ void get_battery_power_draw(char *buffer, unsigned int n, const char *bat) {
 
   snprintf(path, 255, SYSFS_BATTERY_BASE_PATH "/%s/current_now", bat);
   fp = open_file(path, &reported_other);
-  if (fp == nullptr)
-    return;
+  if (fp == nullptr) return;
   ret = fgets(value, 256, fp);
   fclose(fp);
 
-  if (ret == nullptr)
-    return;
+  if (ret == nullptr) return;
   double result = strtol(value, NULL, 10) * 1e-6;
 
   snprintf(path, 255, SYSFS_BATTERY_BASE_PATH "/%s/voltage_now", bat);
   fp = open_file(path, &reported_other);
-  if (fp == nullptr)
-    return;
+  if (fp == nullptr) return;
   ret = fgets(value, 256, fp);
   fclose(fp);
 
-  if (fp == nullptr)
-    return;
+  if (fp == nullptr) return;
   result *= strtol(value, NULL, 10) * 1e-6;
   snprintf(buffer, n, "%.1f", result);
 }
@@ -2784,6 +2846,50 @@ int update_diskio(void) {
   return 0;
 }
 
+std::optional<std::string> get_kv_field(std::istream &in,
+                                        std::string_view key) {
+  std::string line;
+  while (std::getline(in, line)) {
+    // Match "<key>=" at the start of the line.
+    if (!line.starts_with(key) || line.size() <= key.size() ||
+        line[key.size()] != '=') {
+      continue;
+    }
+    std::string value = line.substr(key.size() + 1);
+
+    // Values may be quoted or unquoted; strip surrounding quotes when present.
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+      value = value.substr(1, value.size() - 2);
+    }
+
+    if (!value.empty()) { return value; }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> parse_distribution_from_proc_version(
+    const std::string &version) {
+  for (size_t from = 1; from < version.size(); ++from) {
+    // First braced uppercase text is usually the distribution name:
+    if (version[from - 1] == '(' && std::isupper(version[from])) {
+      // Capture braced content until version number or closing brace:
+      size_t to = from + 1;
+      for (; to < version.size() - 1; to++) {
+        if (version[to] == ' ' &&
+            (std::isdigit(version[to + 1]) || version[to + 1] == ')')) {
+          break;
+        }
+      }
+      if (to >= version.size() - 1) {
+        // No ending delimiter found.
+        break;
+      }
+      return version.substr(from, to - from);
+    }
+  }
+  return std::nullopt;
+}
+
 void print_distribution(struct text_object * /*obj*/, char *p,
                         unsigned int p_max_size) {
   if (p_max_size == 0) return;  // can't do nothing
@@ -2805,34 +2911,21 @@ void print_distribution(struct text_object * /*obj*/, char *p,
     os_rel.open("/usr/lib/os-release");
   }
   if (os_rel) {
-    std::string line;
-    while (std::getline(os_rel, line)) {
-      // NAME is "A string identifying the operating system, without a version
-      // component, and suitable for presentation to the user."
-      if (line.rfind("NAME=", 0) == 0) {
-        std::string name = line.substr(5);
-
-        if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-          name = name.substr(1, name.size() - 2);
-        } else {
-          // unexpected format - string not quoted
-          break;
-        }
-
-        set_result(name);
-        return;
-      }
+    // NAME is "A string identifying the operating system, without a version
+    // component, and suitable for presentation to the user."
+    if (auto name = get_kv_field(os_rel, "NAME")) {
+      set_result(*name);
+      return;
     }
   }
 
   // Alternatives that are already handled by above file:
   // /etc/lsb-release - Debian/Ubuntu only, LSB spec
   // /etc/redhat-release - single string
-  // /etc/centos-release - single string e.g. "CentOS Linux release 7.9.2009 (Core)"
-  // /etc/fedora-release - single string
-  // /etc/debian_version - version only
-  // /etc/alpine-release - version only
-  // /etc/arch-release - single string: "Arch Linux"
+  // /etc/centos-release - single string e.g. "CentOS Linux release 7.9.2009
+  // (Core)" /etc/fedora-release - single string /etc/debian_version - version
+  // only /etc/alpine-release - version only /etc/arch-release - single string:
+  // "Arch Linux"
 
   // 2) Fallback: parse /proc/version
   // This file doesn't necessarily have distribution name in it (e.g. on Arch).
@@ -2841,25 +2934,9 @@ void print_distribution(struct text_object * /*obj*/, char *p,
   if (proc_version) {
     std::string buff;
     std::getline(proc_version, buff);
-    for (size_t from = 1; from < buff.size(); ++from) {
-      // First braced uppercase text is usually the distribution name:
-      if (buff[from - 1] == '(' && std::isupper(buff[from])) {
-        size_t to = from;
-        // Capture braced content until version number or closing brace:
-        for (size_t to = from + 1; to < buff.size() - 1; to++) {
-          if (buff[to] == ' ' &&
-              (std::isdigit(buff[to + 1]) || buff[to + 1] == ')')) {
-            break;
-          }
-        }
-        if (to == buff.size() - 1) {
-          // No ending delimiter found.
-          break;
-        }
-        buff = buff.substr(from, to - from);
-        set_result(buff);
-        return;
-      }
+    if (auto name = parse_distribution_from_proc_version(buff)) {
+      set_result(*name);
+      return;
     }
   }
 
@@ -3225,21 +3302,15 @@ bool is_conky_already_running(void) {
   while ((ent = readdir(dir)) != NULL) {
     char *endptr = ent->d_name;
     long lpid = strtol(ent->d_name, &endptr, 10);
-    if (*endptr != '\0') {
-      continue;
-    }
+    if (*endptr != '\0') { continue; }
 
     snprintf(buf, sizeof(buf), "/proc/%ld/stat", lpid);
     FILE *fp = fopen(buf, "r");
-    if (!fp) {
-      continue;
-    }
+    if (!fp) { continue; }
 
     if (fgets(buf, sizeof(buf), fp) != NULL) {
       char *conky = strstr(buf, "(conky)");
-      if (conky) {
-        instances++;
-      }
+      if (conky) { instances++; }
     }
     fclose(fp);
   }

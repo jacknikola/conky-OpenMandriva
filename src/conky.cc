@@ -30,6 +30,7 @@
 #include "conky.h"
 
 #include "config.h"
+#include "geometry.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -44,6 +45,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <fcntl.h>
@@ -122,14 +124,16 @@
 #include "data/timeinfo.h"
 #include "data/top.h"
 #include "logging.h"
-#include "output/nc.h"
 
 #ifdef BUILD_MYSQL
 #include "data/mysql.h"
 #endif /* BUILD_MYSQL */
 #ifdef BUILD_NVIDIA
-#include "data/hardware/nvidia.h"
+#include "data/hardware/nvidia_XNVCtrl.h"
 #endif /* BUILD_NVIDIA */
+#ifdef BUILD_NVIDIA_NVML
+#include "data/hardware/nvidia_nvml.h"
+#endif /* BUILD_NVIDIA_NVML */
 #ifdef BUILD_CURL
 #include "data/network/ccurl_thread.h"
 #endif /* BUILD_CURL */
@@ -672,7 +676,7 @@ void generate_text_internal(char *p, int p_max_size, struct text_object root) {
 }
 
 void evaluate(const char *text, char *p, int p_max_size) {
-  struct text_object subroot {};
+  struct text_object subroot{};
 
   /**
    * Consider expressions like: ${execp echo '${execp echo hi}'}
@@ -721,7 +725,10 @@ static void generate_text() {
           p[k] = '\n';
           j = 0;
         } else {
-          LOG_WARNING("text_buffer end reached (size {}), increase \"text_buffer_size\"", tbs);
+          LOG_WARNING(
+              "text_buffer end reached (size {}), increase "
+              "\"text_buffer_size\"",
+              tbs);
         }
       } else {
         j++;
@@ -751,7 +758,11 @@ static void generate_text() {
   double time = get_time();
   next_update_time += ui;
   if (next_update_time < time || next_update_time > time + ui) {
-    next_update_time = time - fmod(time, ui) + ui;
+    /* Re-anchor to the next wall-clock boundary (expressed in monotonic time)
+     * so displayed clocks tick on the real second. fmod(get_realtime(), ui) is
+     * how far we are past the last wall boundary; subtract it from monotonic
+     * `time` to get that boundary, then add one interval. */
+    next_update_time = time - fmod(get_realtime(), ui) + ui;
   }
   last_update_time = current_update_time;
   total_updates++;
@@ -862,9 +873,12 @@ void update_text_area() {
     last_font_height = font_height();
     for_each_line(text_buffer, text_size_updater);
 
-    text_size = text_size.max(conky::vec2i(text_size.x() + 1, dpi_scale(minimum_height.get(*state))));
+    text_size = text_size.max(
+        conky::vec2i(text_size.x() + 1, dpi_scale(minimum_height.get(*state))));
     int mw = dpi_scale(maximum_width.get(*state));
     if (mw > 0) text_size = text_size.min(conky::vec2i(mw, text_size.y()));
+
+    LOG_TRACE("computed text size: {}", text_size);
   }
 
   alignment align = text_alignment.get(*state);
@@ -895,23 +909,39 @@ void update_text_area() {
                dpi_scale(gap_x.get(*state)));
       break;
   }
+  auto border = conky::vec2i::uniform(get_border_total());
 #ifdef OWN_WINDOW
   if (align == alignment::NONE) {  // Let the WM manage the window
+#ifdef BUILD_X11
     xy = window.geometry.pos();
+#endif /* BUILD_X11 */
     fixed_pos = 1;
     fixed_size = 1;
   }
-#endif /* OWN_WINDOW */
-#ifdef OWN_WINDOW
 
-  if (own_window.get(*state) && (fixed_pos == 0)) {
-    int border_total = get_border_total();
-    text_start = conky::vec2i::uniform(border_total);
-    window.geometry.set_pos(xy - text_start);
+  if (own_window.get(*state)) {
+    // The managed window owns its geometry: display-x11 diffs
+    // window.geometry.size() against the desired size to decide when to
+    // XResizeWindow, so we must not overwrite the size here.
+    if (fixed_pos == 0) {
+      text_start = border;
+#ifdef BUILD_X11
+      window.geometry.set_pos(xy - border);
+#endif /* BUILD_X11 */
+    } else {
+      text_start = xy;
+    }
   } else
 #endif
   {
+    // Root-mounted: there's no managed window, so keep window.geometry (used
+    // for mouse hit-testing) current here. The border is painted outward from
+    // xy, so the rect is the border box around xy.
     text_start = xy;
+#ifdef BUILD_X11
+    window.geometry.set_pos(xy - border);
+    window.geometry.set_size(text_size + border * 2);
+#endif /* BUILD_X11 */
   }
 }
 
@@ -927,6 +957,10 @@ static draw_mode_t draw_mode; /* FG, BG or OUTLINE */
 
 static int text_size_updater(char *s, int special_index) {
   int w = 0;
+  /* extra line height contributed by tall bars/gauges/graphs, mirroring the
+   * `cur_y_add` accumulator in draw_each_line_inner. Tracked separately from
+   * last_font_height so that voffsets on the same line are not discarded. */
+  int cur_y_add = 0;
   char *p;
   special_node *current = specials;
 
@@ -947,9 +981,8 @@ static int text_size_updater(char *s, int special_index) {
           current->type == text_node_t::GAUGE ||
           current->type == text_node_t::GRAPH) {
         w += current->width;
-        if (current->height > last_font_height) {
-          last_font_height = current->height;
-          last_font_height += font_height();
+        if (current->height > cur_y_add && current->height > font_height()) {
+          cur_y_add = current->height;
         }
       } else if (current->type == text_node_t::OFFSET) {
         if (current->arg > 0) { w += current->arg; }
@@ -983,7 +1016,7 @@ static int text_size_updater(char *s, int special_index) {
   int mw = dpi_scale(maximum_width.get(*state));
   if (mw > 0) { text_size.set_x(std::min(mw, text_size.x())); }
 
-  text_size += conky::vec2i(0, last_font_height);
+  text_size += conky::vec2i(0, last_font_height + cur_y_add);
   last_font_height = font_height();
   return special_index;
 }
@@ -993,12 +1026,15 @@ static inline void set_foreground_color(Colour c) {
   for (auto output : display_outputs()) output->set_foreground_color(c);
 }
 
-static inline void draw_graph_bars(special_node *current, std::unique_ptr<Colour[]>& tmpcolour, 
-                            conky::vec2i& text_offset, int i, int &j, int w, 
-                            int &colour_idx, int cur_x, int by, int h) {
+static inline void draw_graph_bars(special_node *current,
+                                   std::unique_ptr<Colour[]> &tmpcolour,
+                                   conky::vec2i &text_offset, int i, int &j,
+                                   int w, int &colour_idx, int cur_x, int by,
+                                   int h) {
   double graphheight = current->graph_data[j] * (h - 1) / current->scale;
-  /* Check if graphheight is less than the minheight threshold, if so we must change it to the threshold */
-  if(graphheight > 0 && current->minheight - graphheight > 0) {
+  /* Check if graphheight is less than the minheight threshold, if so we must
+   * change it to the threshold */
+  if (graphheight > 0 && current->minheight - graphheight > 0) {
     current->graph_data[j] = current->minheight * current->scale / (h - 1);
   }
   if (current->colours_set) {
@@ -1006,18 +1042,18 @@ static inline void draw_graph_bars(special_node *current, std::unique_ptr<Colour
       set_foreground_color(tmpcolour[static_cast<int>(
           static_cast<float>(w - 2) -
           current->graph_data[j] * (w - 2) /
-              std::max(static_cast<float>(current->scale),
-                        1.0F))]);
+              std::max(static_cast<float>(current->scale), 1.0F))]);
     } else {
       set_foreground_color(tmpcolour[colour_idx++]);
     }
   }
   /* Handle the case where y axis is to be inverted */
   int offsety1 = current->inverty ? by : by + h;
-  int offsety2 = current->inverty ? by +  current->graph_data[j] * (h - 1) / current->scale
-                          : round_to_positive_int(static_cast<double>(by) + h -
-                          current->graph_data[j] * (h - 1) /
-                          current->scale);
+  int offsety2 = current->inverty
+                     ? by + current->graph_data[j] * (h - 1) / current->scale
+                     : round_to_positive_int(static_cast<double>(by) + h -
+                                             current->graph_data[j] * (h - 1) /
+                                                 current->scale);
   /* this is mugfugly, but it works */
   if (display_output()) {
     display_output()->draw_line(
@@ -1175,8 +1211,11 @@ int draw_each_line_inner(char *s, int special_index, int last_special_applied) {
           if (display_output() && display_output()->graphical()) {
             int h = current->height;
             int mid = font_ascent() / 2;
+            int max_width = text_start.x() + text_size.x() - cur_x;
 
-            w = text_start.x() + text_size.x() - cur_x;
+            /* if no width was specified, current->width is set to 0 */
+            w = current->width;
+            if (w <= 0 || w > max_width) { w = max_width; }
 
             if (display_output()) {
               display_output()->set_line_style(h, true);
@@ -1193,9 +1232,13 @@ int draw_each_line_inner(char *s, int special_index, int last_special_applied) {
             int h = current->height;
             char tmp_s = current->arg;
             int mid = font_ascent() / 2;
+            int max_width = text_start.x() + text_size.x() - cur_x - 1;
             char ss[2] = {tmp_s, tmp_s};
 
-            w = text_start.x() + text_size.x() - cur_x - 1;
+            /* if no width was specified, current->width is set to 0 */
+            w = current->width;
+            if (w <= 0 || w > max_width) { w = max_width; }
+
             if (display_output()) {
               display_output()->set_line_style(h, false);
               display_output()->set_dashes(ss);
@@ -1300,7 +1343,8 @@ int draw_each_line_inner(char *s, int special_index, int last_special_applied) {
             if (w == 0) {
               w = text_start.x() + text_size.x() - cur_x - 1;
               current->graph_width = std::max(w - 1, 0);
-              if (current->graph_width != static_cast<int>(current->graph_data.size())) {
+              if (current->graph_width !=
+                  static_cast<int>(current->graph_data.size())) {
                 w = static_cast<int>(current->graph_data.size()) + 1;
               }
             }
@@ -1325,16 +1369,15 @@ int draw_each_line_inner(char *s, int special_index, int last_special_applied) {
                 delete factory;
               }
               colour_idx = 0;
-              if(current->invertx){
+              if (current->invertx) {
                 for (i = 0; i <= w - 2; i++) {
-                  draw_graph_bars(current, tmpcolour, text_offset, 
-                  i, j, w, colour_idx, cur_x, by, h);
+                  draw_graph_bars(current, tmpcolour, text_offset, i, j, w,
+                                  colour_idx, cur_x, by, h);
                 }
-              }
-              else{
+              } else {
                 for (i = w - 2; i > -1; i--) {
-                  draw_graph_bars(current, tmpcolour, text_offset, 
-                  i, j, w, colour_idx, cur_x, by, h);
+                  draw_graph_bars(current, tmpcolour, text_offset, i, j, w,
+                                  colour_idx, cur_x, by, h);
                 }
               }
             }
@@ -1395,8 +1438,9 @@ int draw_each_line_inner(char *s, int special_index, int last_special_applied) {
 #ifdef BUILD_MATH
             if (show_graph_scale.get(*state) && (current->show_scale == 1)) {
               if (current->colours_set) {
-                  // Set the foreground colour to the first colour, ensures the scale text is always drawn in the same colour
-                  set_foreground_color(current->first_colour);
+                // Set the foreground colour to the first colour, ensures the
+                // scale text is always drawn in the same colour
+                set_foreground_color(current->first_colour);
               }
               int tmp_x = cur_x;
               int tmp_y = cur_y;
@@ -1705,20 +1749,28 @@ bool is_on_battery() {  // checks if at least one battery specified in
 volatile sig_atomic_t g_sigterm_pending, g_sighup_pending, g_sigusr2_pending;
 
 void get_system_details() {
-  char *session_ty = getenv("XDG_SESSION_TYPE");
-  if (session_ty == nullptr) {
-    info.system.session = conky::info::display_session::unknown;
-  } else if (std::strcmp(session_ty, "x11") == 0) {
+  // XDG_SESSION_TYPE is authoritative when present, but it's frequently unset
+  // or reports "tty"/"unspecified". Fall back to the protocol-specific display
+  // sockets: Wayland always exports WAYLAND_DISPLAY, and X11 virtually always
+  // exports DISPLAY. DISPLAY wins over WAYLAND_DISPLAY: when both are present
+  // an X server (Xwayland) is provably available and an X11 surface works on
+  // either session type, so it's the safe choice to commit to.
+  const char *session_ty = getenv("XDG_SESSION_TYPE");
+  if (session_ty != nullptr && std::strcmp(session_ty, "wayland") == 0) {
+    info.system.session = conky::info::display_session::wayland;
+  } else if (session_ty != nullptr && std::strcmp(session_ty, "x11") == 0) {
     info.system.session = conky::info::display_session::x11;
-  } else if (std::strcmp(session_ty, "wayland") == 0) {
+  } else if (getenv("DISPLAY") != nullptr) {
+    info.system.session = conky::info::display_session::x11;
+  } else if (getenv("WAYLAND_DISPLAY") != nullptr) {
     info.system.session = conky::info::display_session::wayland;
   } else {
     info.system.session = conky::info::display_session::unknown;
   }
 
   info.system.wm_name = getenv("XDG_CURRENT_DESKTOP");
-  // Per spec, XDG_CURRENT_DESKTOP is a semicolon separated list. In practice,
-  // nearly all WM/DEs simply define a single name.
+  // Per spec, XDG_CURRENT_DESKTOP is a colon-separated list (e.g.
+  // "ubuntu:GNOME" on Ubuntu). The first matching token wins.
   // Others below are non-standard:
   if (info.system.wm_name == nullptr) {
     info.system.wm_name = getenv("XDG_SESSION_DESKTOP");
@@ -1731,6 +1783,17 @@ void get_system_details() {
   }
 
 #ifdef ENABLE_RUNTIME_TWEAKS
+  std::vector<std::string_view> wm_name_tokens;
+  if (info.system.wm_name != nullptr) {
+    std::string_view rest{info.system.wm_name};
+    while (!rest.empty()) {
+      auto sep = rest.find(':');
+      wm_name_tokens.push_back(rest.substr(0, sep));
+      if (sep == std::string_view::npos) { break; }
+      rest.remove_prefix(sep + 1);
+    }
+  }
+
   const auto is_wayland = [&]() {
 #ifndef BUILD_WAYLAND
     return info.system.session == conky::info::display_session::wayland;
@@ -1740,69 +1803,86 @@ void get_system_details() {
 #endif
   };
 
-  const auto is_session = [&](auto &&...names) {
-    return ((std::strcmp(info.system.wm_name, names) == 0) || ...);
+  const auto is_session = [](std::string_view token, auto &&...names) {
+    return ((token == std::string_view{names}) || ...);
   };
 
   // Only add is_wayland guard for WM/DE that will never support another display
   // session protocol. e.g. Budgie will (or has) switch(ed) to Wayland at some
   // point, but older versions may use X11, so it needs to be detected for both
   // X11 and Wayland.
-  if (info.system.wm_name == nullptr) {
-    goto unknown_session;
-  } else if (is_session("GNOME")) {
-    info.system.wm = conky::info::window_manager::mutter;
-  } else if (is_session("GNOME Classic", "metacity")) {
-    info.system.wm = conky::info::window_manager::metacity;
-  } else if (is_session("MATE")) {
-    info.system.wm = conky::info::window_manager::marco;
-  } else if (is_session("XFCE", "XFCE4")) {
-    info.system.wm = conky::info::window_manager::xfwm;
-  } else if (is_session("KDE", "Plasma", "KDE Plasma")) {
-    info.system.wm = conky::info::window_manager::kwin;
-  } else if (is_session("LXDE", "LXQt")) {
-    info.system.wm = conky::info::window_manager::openbox;
-  } else if (is_session("Unity")) {
-    info.system.wm = conky::info::window_manager::compiz;
-  } else if (is_session("Cinnamon")) {
-    info.system.wm = conky::info::window_manager::mutter;  // Muffin → Mutter
-  } else if (!is_wayland() && is_session("Openbox")) {
-    // Openbox doesn't set any session name env variables; must be set manually
-    info.system.wm = conky::info::window_manager::openbox;
-  } else if (!is_wayland() && is_session("Fluxbox")) {
-    // Fluxbox doesn't set any session name env variables; must be set manually 
-    info.system.wm = conky::info::window_manager::fluxbox;
-  } else if (!is_wayland() && (is_session("i3", "i3wm"))) {
-    info.system.wm = conky::info::window_manager::i3;
-  } else if (is_wayland() && is_session("Hyprland")) {
-    info.system.wm = conky::info::window_manager::hyprland;
-  } else if (is_wayland() && is_session("Sway")) {
-    info.system.wm = conky::info::window_manager::sway;
-  } else if (!is_wayland() && is_session("bspwm")) {
-    info.system.wm = conky::info::window_manager::bspwm;
-  } else if (is_session("awesome")) {
-    // some talks about adding Wayland support
-    info.system.wm = conky::info::window_manager::awesome;
-  } else if (!is_wayland() && is_session("dwm")) {
-    info.system.wm = conky::info::window_manager::dwm;
-  } else if (!is_wayland() && is_session("herbstluftwm")) {
-    info.system.wm = conky::info::window_manager::herbstluftwm;
-  } else if (!is_wayland() && is_session("qtile")) {
-    info.system.wm = conky::info::window_manager::qtile;
-  } else if (!is_wayland() && is_session("windowmaker")) {
-    info.system.wm = conky::info::window_manager::windowmaker;
-  } else if (is_wayland() && is_session("Wayfire")) {
-    info.system.wm = conky::info::window_manager::wayfire;
-  } else if (is_wayland() && is_session("River")) {
-    info.system.wm = conky::info::window_manager::river;
-  } else if (is_session("Budgie")) {
-    info.system.wm = conky::info::window_manager::mutter;  // Budgie → Mutter
-  } else if (is_session("Deepin")) {
-    info.system.wm = conky::info::window_manager::dde;
-  } else if (is_session("Enlightenment", "E17")) {
-    info.system.wm = conky::info::window_manager::enlightenment;
-  } else {
-  unknown_session:
+  const auto detect_session = [&](std::string_view token) {
+    if (is_session(token, "GNOME")) {
+      info.system.wm = conky::info::window_manager::mutter;
+    } else if (is_session(token, "GNOME Classic", "metacity")) {
+      info.system.wm = conky::info::window_manager::metacity;
+    } else if (is_session(token, "MATE")) {
+      info.system.wm = conky::info::window_manager::marco;
+    } else if (is_session(token, "XFCE", "XFCE4")) {
+      info.system.wm = conky::info::window_manager::xfwm;
+    } else if (is_session(token, "KDE", "Plasma", "KDE Plasma")) {
+      info.system.wm = conky::info::window_manager::kwin;
+    } else if (is_session(token, "LXDE", "LXQt")) {
+      info.system.wm = conky::info::window_manager::openbox;
+    } else if (is_session(token, "Unity")) {
+      info.system.wm = conky::info::window_manager::compiz;
+    } else if (is_session(token, "Cinnamon")) {
+      // Muffin → Mutter
+      info.system.wm = conky::info::window_manager::mutter;
+    } else if (!is_wayland() && is_session(token, "Openbox")) {
+      // Openbox doesn't set any session name env variables; must be set
+      // manually
+      info.system.wm = conky::info::window_manager::openbox;
+    } else if (!is_wayland() && is_session(token, "Fluxbox")) {
+      // Fluxbox doesn't set any session name env variables; must be set
+      // manually
+      info.system.wm = conky::info::window_manager::fluxbox;
+    } else if (!is_wayland() && (is_session(token, "i3", "i3wm"))) {
+      info.system.wm = conky::info::window_manager::i3;
+    } else if (is_wayland() && is_session(token, "Hyprland")) {
+      info.system.wm = conky::info::window_manager::hyprland;
+    } else if (is_wayland() && is_session(token, "Sway")) {
+      info.system.wm = conky::info::window_manager::sway;
+    } else if (!is_wayland() && is_session(token, "bspwm")) {
+      info.system.wm = conky::info::window_manager::bspwm;
+    } else if (is_session(token, "awesome")) {
+      // some talks about adding Wayland support
+      info.system.wm = conky::info::window_manager::awesome;
+    } else if (!is_wayland() && is_session(token, "dwm")) {
+      info.system.wm = conky::info::window_manager::dwm;
+    } else if (!is_wayland() && is_session(token, "herbstluftwm")) {
+      info.system.wm = conky::info::window_manager::herbstluftwm;
+    } else if (!is_wayland() && is_session(token, "qtile")) {
+      info.system.wm = conky::info::window_manager::qtile;
+    } else if (!is_wayland() && is_session(token, "windowmaker")) {
+      info.system.wm = conky::info::window_manager::windowmaker;
+    } else if (is_wayland() && is_session(token, "Wayfire")) {
+      info.system.wm = conky::info::window_manager::wayfire;
+    } else if (is_wayland() && is_session(token, "River")) {
+      info.system.wm = conky::info::window_manager::river;
+    } else if (is_session(token, "Budgie")) {
+      // Budgie → Mutter
+      info.system.wm = conky::info::window_manager::mutter;
+    } else if (is_session(token, "Deepin")) {
+      info.system.wm = conky::info::window_manager::dde;
+    } else if (is_session(token, "Enlightenment", "E17")) {
+      info.system.wm = conky::info::window_manager::enlightenment;
+    } else {
+      return false;
+    }
+
+    return true;
+  };
+
+  bool detected_session = false;
+  for (const auto &token : wm_name_tokens) {
+    if (detect_session(token)) {
+      detected_session = true;
+      break;
+    }
+  }
+
+  if (!detected_session) {
     info.system.wm_name = "unknown";
     info.system.wm = conky::info::window_manager::unknown;
 
@@ -1820,10 +1900,23 @@ void get_system_details() {
   }
 #endif
 
-  if (info.system.wm_name != nullptr) {
-    LOG_INFO("'{}' {} session running", info.system.wm_name, session_ty);
-  } else {
-    LOG_INFO("unknown {} session running", session_ty);
+  const char *session_name = nullptr;
+  switch (info.system.session) {
+    case conky::info::display_session::x11:
+      session_name = "x11";
+      break;
+    case conky::info::display_session::wayland:
+      session_name = "wayland";
+      break;
+    case conky::info::display_session::unknown:
+      break;
+  }
+  if (session_name != nullptr) {
+    if (info.system.wm_name != nullptr) {
+      LOG_INFO("'{}' {} session running", info.system.wm_name, session_name);
+    } else {
+      LOG_INFO("unknown {} session running", session_name);
+    }
   }
 }
 
@@ -1853,8 +1946,23 @@ void main_loop() {
   get_system_details();
 
   last_update_time = 0.0;
-  next_update_time = get_time() - fmod(get_time(), active_update_interval());
+  /* Align the update grid to wall-clock (not monotonic) second boundaries so
+   * displayed clocks don't lag by the monotonic/realtime phase offset. This is
+   * <= now, so the first update still fires immediately. */
+  next_update_time =
+      get_time() - fmod(get_realtime(), active_update_interval());
   info.looped = 0;
+
+  /* `${top cpu}` reports the share of CPU time a process consumed between two
+   * samples, so it needs a prior sample to diff against. In one-shot mode
+   * (total_run_times == 1) only a single frame is produced, which would leave
+   * every process reading 0% (#1376). Take a priming sample now and push the
+   * first (and only) real update back by one interval so it has a baseline. */
+  if (top_cpu != 0 && total_run_times.get(*state) == 1) {
+    update_top();
+    next_update_time += active_update_interval();
+  }
+
   while (terminate == 0 && (total_run_times.get(*state) == 0 ||
                             info.looped < total_run_times.get(*state))) {
     if ((update_interval_on_battery.get(*state) != NOBATTERY)) {
@@ -1983,11 +2091,13 @@ void main_loop() {
 /* reload the config file */
 static void reload_config() {
   auto _scope = LOG_SCOPE("reload_config");
-  struct stat sb {};
+  struct stat sb{};
   if ((stat(current_config.c_str(), &sb) != 0) ||
       (!S_ISREG(sb.st_mode) && !S_ISLNK(sb.st_mode))) {
-    LOG_WARNING("config file '{}' is gone, continuing with config from memory (send SIGUSR1 after recreating: kill -s USR1 {})",
-             current_config, getpid());
+    LOG_WARNING(
+        "config file '{}' is gone, continuing with config from memory (send "
+        "SIGUSR1 after recreating: kill -s USR1 {})",
+        current_config, getpid());
     return;
   }
   clean_up();
@@ -2035,6 +2145,10 @@ void clean_up(void) {
   llua_shutdown_hook();
 #if defined BUILD_RSS
   xmlCleanupParser();
+#endif
+
+#ifdef BUILD_NVIDIA_NVML
+  shutdown_nvml();
 #endif
 
   free_specials(specials);
@@ -2111,14 +2225,16 @@ void load_config_file() {
 #endif
   } catch (lua::syntax_error &e) {
 #ifdef BUILD_OLD_CONFIG
-    LOG_WARNING("syntax error ({}) while reading config file '{}'", e.what(), current_config);
+    LOG_WARNING("syntax error ({}) while reading config file '{}'", e.what(),
+                current_config);
     LOG_INFO("assuming old config syntax and attempting conversion");
     // the strchr thingy skips the first line (#! /usr/bin/lua)
     l.loadstring(strchr(convertconf, '\n'));
     l.pushstring(current_config.c_str());
     l.call(1, 1);
 #else
-    throw conky::error(fmt::format("syntax error ({}) while reading config file", e.what()));
+    throw conky::error(
+        fmt::format("syntax error ({}) while reading config file", e.what()));
 #endif
   }
   l.call(0, 0);
@@ -2148,7 +2264,7 @@ inline void reset_optind() {
 
 void set_current_config() {
   /* load current_config, CONFIG_FILE or SYSTEM_CONFIG_FILE */
-  struct stat s {};
+  struct stat s{};
 
   if (current_config.empty()) {
     /* Try to use personal config file first */
@@ -2171,7 +2287,8 @@ void set_current_config() {
   if (current_config.empty()) {
 #ifdef BUILD_BUILTIN_CONFIG
     current_config = builtin_config_magic;
-    LOG_WARNING("no personal or system-wide config file found, using builtin default");
+    LOG_WARNING(
+        "no personal or system-wide config file found, using builtin default");
 #else
     throw conky::error("no personal or system-wide config file found");
 #endif
@@ -2184,8 +2301,9 @@ void set_current_config() {
 /* : means that character before that takes an argument */
 const char *getopt_string =
     "vVqdDLSs:t:u:i:hc:p:"
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || \
-    defined(__HAIKU__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) ||        \
+    defined(__FreeBSD_kernel__) || defined(__HAIKU__) || \
+    defined(__NetBSD__) || defined(__OpenBSD__)
     "U"
 #endif /* Linux || FreeBSD || Haiku || NetBSD || OpenBSD */
 #ifdef BUILD_X11
@@ -2200,31 +2318,37 @@ const char *getopt_string =
 #endif
     ;
 
-const struct option longopts[] = {
-    {"help", 0, nullptr, 'h'},          {"version", 0, nullptr, 'v'},
-    {"short-version", 0, nullptr, 'V'}, {"quiet", 0, nullptr, 'q'},
-    {"debug", 0, nullptr, 'D'},         {"concise", 0, nullptr, 'L'},
-    {"config", 1, nullptr, 'c'},
+const struct option longopts[] = {{"help", 0, nullptr, 'h'},
+                                  {"version", 0, nullptr, 'v'},
+                                  {"short-version", 0, nullptr, 'V'},
+                                  {"quiet", 0, nullptr, 'q'},
+                                  {"debug", 0, nullptr, 'D'},
+                                  {"concise", 0, nullptr, 'L'},
+                                  {"config", 1, nullptr, 'c'},
 #ifdef BUILD_BUILTIN_CONFIG
-    {"print-config", 0, nullptr, 'C'},
+                                  {"print-config", 0, nullptr, 'C'},
 #endif
-    {"daemonize", 0, nullptr, 'd'},
+                                  {"daemonize", 0, nullptr, 'd'},
 #ifdef BUILD_X11
-    {"alignment", 1, nullptr, 'a'},     {"display", 1, nullptr, 'X'},
-    {"xinerama-head", 1, nullptr, 'm'}, {"font", 1, nullptr, 'f'},
+                                  {"alignment", 1, nullptr, 'a'},
+                                  {"display", 1, nullptr, 'X'},
+                                  {"xinerama-head", 1, nullptr, 'm'},
+                                  {"font", 1, nullptr, 'f'},
 #ifdef OWN_WINDOW
-    {"own-window", 0, nullptr, 'o'},
+                                  {"own-window", 0, nullptr, 'o'},
 #endif
-    {"double-buffer", 0, nullptr, 'b'}, {"window-id", 1, nullptr, 'w'},
+                                  {"double-buffer", 0, nullptr, 'b'},
+                                  {"window-id", 1, nullptr, 'w'},
 #endif /* BUILD_X11 */
-    {"text", 1, nullptr, 't'},          {"interval", 1, nullptr, 'u'},
-    {"pause", 1, nullptr, 'p'},
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || \
-    defined(__HAIKU__) || defined(__NetBSD__) || defined(__OpenBSD__)
-    {"unique", 0, nullptr, 'U'},
+                                  {"text", 1, nullptr, 't'},
+                                  {"interval", 1, nullptr, 'u'},
+                                  {"pause", 1, nullptr, 'p'},
+#if defined(__linux__) || defined(__FreeBSD__) ||        \
+    defined(__FreeBSD_kernel__) || defined(__HAIKU__) || \
+    defined(__NetBSD__) || defined(__OpenBSD__)
+                                  {"unique", 0, nullptr, 'U'},
 #endif /* Linux || FreeBSD || Haiku || NetBSD || OpenBSD */
-    {nullptr, 0, nullptr, 0}
-};
+                                  {nullptr, 0, nullptr, 0}};
 
 void setup_inotify() {
 #ifdef HAVE_SYS_INOTIFY_H
@@ -2239,8 +2363,7 @@ void setup_inotify() {
 }
 void initialisation(int argc, char **argv) {
   auto _scope = LOG_SCOPE("init");
-  struct sigaction act {
-  }, oact{};
+  struct sigaction act{}, oact{};
 
   clear_net_stats();
   set_default_configurations();
@@ -2299,17 +2422,10 @@ void initialisation(int argc, char **argv) {
         own_window.lua_set(*state);
         break;
 #endif
-#ifdef BUILD_XDBE
       case 'b':
         state->pushboolean(true);
-        use_xdbe.lua_set(*state);
+        use_double_buffer.lua_set(*state);
         break;
-#else
-      case 'b':
-        state->pushboolean(true);
-        use_xpmdb.lua_set(*state);
-        break;
-#endif
 #endif /* BUILD_X11 */
       case 't':
         free_and_zero(global_text);
@@ -2355,7 +2471,7 @@ void initialisation(int argc, char **argv) {
           sleep(startup_pause);
         }
         break;
-      // case '?' is handled by main.cc
+        // case '?' is handled by main.cc
     }
   }
 

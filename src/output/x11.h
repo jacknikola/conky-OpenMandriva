@@ -31,7 +31,10 @@
 #error x11.h included when BUILD_X11 is disabled
 #endif
 
+extern "C" {
+#include <X11/X.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <X11/Xlib.h>
@@ -43,16 +46,20 @@
 #ifdef BUILD_XDBE
 #include <X11/extensions/Xdbe.h>
 #endif
+#ifdef BUILD_XDAMAGE
+#include <X11/extensions/Xdamage.h>
+#endif
+#ifdef BUILD_XFIXES
+#include <X11/extensions/Xfixes.h>
+#endif
+}
 
 #include <cstdint>
 #include <functional>
 #include <vector>
 
-// TODO: remove lua requirement from x11_init_window
-#include "../lua/llua.h"
-
 #include "../geometry.h"
-#include "gui.h"
+#include "x11-event.h"
 
 #define ATOM(a) XInternAtom(display, #a, False)
 
@@ -62,6 +69,21 @@ extern Display *display;
 extern int screen;
 
 constexpr int argb8888_color_depth = 32;
+
+#ifndef BUILD_XFIXES
+using XserverRegion = XID;
+#endif
+#ifndef BUILD_XDAMAGE
+using Damage = XID;
+#endif
+#ifndef BUILD_XFT
+using XftDraw = void;
+#endif
+#ifdef BUILD_XDBE
+using back_buffer_t = XdbeBackBuffer;
+#else
+using back_buffer_t = Pixmap;
+#endif
 
 struct conky_x11_window {
   /// XID of x11 root window
@@ -74,18 +96,19 @@ struct conky_x11_window {
   Visual *visual;
   Colormap colourmap;
   GC gc;
-  
+
   /// Background opacity of the window (0-255).
-  /// 
+  ///
   /// This is set directly by lua settings - read them directly from
   /// backend-agnostic code.
   uint8_t opacity;
   /// Window buffer color depth.
-  /// 
+  ///
   /// Value `32` means X11 supports ARGB8888 (has a compositor).
-  /// Value `24` means only full background transparency is supported (no compositor).
-  /// Value `0` means `CopyFromParent`, i.e. default value, which is always `24`.
-  /// 
+  /// Value `24` means only full background transparency is supported (no
+  /// compositor). Value `0` means `CopyFromParent`, i.e. default value, which
+  /// is always `24`.
+  ///
   /// It can be something other than those 3 values (e.g. monochrome displays),
   /// but that's exceedingly rare.
   uint8_t color_depth;
@@ -93,19 +116,33 @@ struct conky_x11_window {
   // Mask containing all events captured by conky
   int64_t event_mask;
 
-#ifdef BUILD_XDBE
-  XdbeBackBuffer back_buffer;
-#else  /*BUILD_XDBE*/
-  Pixmap back_buffer;
-#endif /*BUILD_XDBE*/
-#ifdef BUILD_XFT
+  /// XInput2 event base index; 0 if unavailable.
+  int xdamage_event_base = 0;
+  /// XDamage error base index; 0 if unavailable.
+  int xdamage_error_base = 0;
+
+  /// Client-side region accumulating areas needing repaint (from Expose
+  /// events).
+  Region repaint_region = 0;
+
+  /// XDamage handle for conky's window; `None` if XDamage is unavailable.
+  Damage window_damage = 0;
+  /// Server-side region accumulating damaged areas reported by XDamage.
+  XserverRegion damage_region = 0;
+  /// Server-side scratch region holding a single XDamageNotify area before it
+  /// is unioned into `damage_region`.
+  XserverRegion damage_scratch = 0;
+
+  back_buffer_t back_buffer;
   XftDraw *xftdraw;
-#endif /*BUILD_XFT*/
+
   /// XInput2 extension opcode; 0 if unavailable.
   std::int32_t xi_opcode;
 
   /// @brief Window geometry in screen coordinate space
   conky::rect<int> geometry;
+
+  bool cursor_over_window = false;
 };
 
 extern struct conky_x11_window window;
@@ -123,7 +160,11 @@ void get_x11_desktop_info(Display *current_display, Atom atom);
 /// Prints out a warning if user is using one of sessions that are known not to
 /// work.
 void set_struts();
-void x11_init_window(lua::state &l, bool own);
+void x11_init_window(lua::state &l);
+/// Allocates the double-buffer back buffer (XDBE, or pixmap fallback); call
+/// once the X window exists. Returns false when double buffering is
+/// unavailable.
+bool x11_set_up_double_buffer(lua::state &l);
 void deinit_x11();
 
 /// @brief Forwards argument event to the top-most window at event positon that
@@ -133,7 +174,7 @@ void deinit_x11();
 /// position **at invocation time**.
 /// @param event event to forward
 /// @param cookie optional cookie data
-void propagate_x11_event(XEvent &event, const void *cookie = nullptr);
+void propagate_x11_event(conky::x11::event &event);
 
 /// @brief Returns a list of window values for the given atom.
 /// @param display display with which the atom is associated
@@ -176,7 +217,8 @@ Window query_x11_top_parent(Display *display, Window child);
 /// @param y screen Y position contained by window
 /// @param device_id pointer device id to be queried
 /// @return a top-most window at provided screen coordinates, or root
-Window query_x11_window_at_pos(Display *display, conky::vec2i pos, int device_id);
+Window query_x11_window_at_pos(Display *display, conky::vec2i pos,
+                               int device_id);
 
 /// @brief Returns a list of windows overlapping provided screen coordinates.
 ///
@@ -195,10 +237,6 @@ std::vector<Window> query_x11_windows_at_pos(
         [](XWindowAttributes &a) { return true; },
     bool eager = false);
 
-#ifdef BUILD_XDBE
-void xdbe_swap_buffers(void);
-#else
-void xpmdb_swap_buffers(void);
-#endif /* BUILD_XDBE */
+void swap_x11_buffers();
 
 #endif /* CONKY_X11_H */

@@ -345,11 +345,11 @@ if(BUILD_X11)
   set(x11
     output/display-x11.cc
     output/display-x11.hh
-    lua/x11-settings.cc
     lua/x11-settings.h
     output/x11-color.cc
     output/x11.cc
     output/x11.h
+    output/x11-event.cc
   )
   set(optional_sources ${optional_sources} ${x11})
 endif(BUILD_X11)
@@ -368,6 +368,8 @@ if(BUILD_WAYLAND)
   set(wl_sources
     output/wl.cc
     output/wl.h
+    output/wl-shell.cc
+    output/wl-shell.h
     output/display-wayland.cc
     output/display-wayland.hh
     xdg-shell-protocol.c
@@ -383,6 +385,8 @@ if(BUILD_WAYLAND)
       "${CMAKE_CURRENT_SOURCE_DIR}/wl_protocols" # first for reproducibility
       "${Wayland_PROTOCOLS_DIR}/stable/${name}"
       "${Wayland_PROTOCOLS_DIR}/stable"
+      "${Wayland_PROTOCOLS_DIR}/staging/${name}"
+      "${Wayland_PROTOCOLS_DIR}/staging"
       "${Wayland_PROTOCOLS_DIR}/unstable/${name}"
       "${Wayland_PROTOCOLS_DIR}/unstable"
     )
@@ -429,6 +433,10 @@ if(BUILD_WAYLAND)
   
   add_protocol(xdg-shell)
   add_protocol(wlr-layer-shell v1)
+  add_protocol(viewporter)
+  # fractional-scale-v1 is vendored in wl_protocols/ (found first), so the build
+  # doesn't require a recent (>=1.31) system wayland-protocols package.
+  add_protocol(fractional-scale v1)
 
   set(optional_sources ${optional_sources} ${wl_sources})
 endif(BUILD_WAYLAND)
@@ -457,9 +465,14 @@ if(BUILD_RSS)
 endif(BUILD_RSS)
 
 if(BUILD_NVIDIA)
-  set(nvidia data/hardware/nvidia.cc data/hardware/nvidia.h)
+  set(nvidia data/hardware/nvidia_XNVCtrl.cc data/hardware/nvidia_XNVCtrl.h)
   set(optional_sources ${optional_sources} ${nvidia})
 endif(BUILD_NVIDIA)
+
+if(BUILD_NVIDIA_NVML)
+  set(nvidia data/hardware/nvidia_nvml.cc data/hardware/nvidia_nvml.h)
+  set(optional_sources ${optional_sources} ${nvidia})
+endif(BUILD_NVIDIA_NVML)
 
 if(BUILD_IMLIB2)
   set(imlib2 conky-imlib2.cc conky-imlib2.h)
@@ -488,8 +501,6 @@ endif(BUILD_ICONV)
 
 if(BUILD_NCURSES)
   set(ncurses_srcs
-    output/nc.cc
-    output/nc.h
     output/display-ncurses.cc
     output/display-ncurses.hh
   )

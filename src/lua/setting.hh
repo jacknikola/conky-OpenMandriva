@@ -293,8 +293,7 @@ simple_config_setting<T, Traits>::do_convert(lua::state &l, int index) {
     LOG_ERROR(
         "invalid value of type '{}' for setting '{}', "
         "expected type '{}'",
-        l.type_name(l.type(index)), Base::name,
-        l.type_name(Traits::type));
+        l.type_name(l.type(index)), Base::name, l.type_name(Traits::type));
     return {default_value, false};
   }
 
@@ -320,16 +319,14 @@ void simple_config_setting<T, Traits>::lua_setter(lua::state &l, bool init) {
 }
 
 template <typename Signed1, typename Signed2>
-bool between(Signed1 value, Signed2 min,
-             typename std::enable_if<std::is_signed<Signed2>::value,
-                                     Signed2>::type max) {
+  requires std::is_signed_v<Signed2>
+bool between(Signed1 value, Signed2 min, Signed2 max) {
   return value >= min && value <= max;
 }
 
 template <typename Signed1, typename Unsigned2>
-bool between(Signed1 value, Unsigned2 min,
-             typename std::enable_if<std::is_unsigned<Unsigned2>::value,
-                                     Unsigned2>::type max) {
+  requires std::is_unsigned_v<Unsigned2>
+bool between(Signed1 value, Unsigned2 min, Unsigned2 max) {
   return value >= 0 &&
          static_cast<typename std::make_unsigned<Signed1>::type>(value) >=
              min &&
@@ -361,7 +358,8 @@ class range_config_setting : public simple_config_setting<T, Traits> {
                                                             int index) {
     auto ret = Base::do_convert(l, index);
     if (ret.second && !between(ret.first, min, max)) {
-      LOG_ERROR("value {} is out of range for setting '{}' (expected {}-{})", ret.first, Base::name, min, max);
+      LOG_ERROR("value {} is out of range for setting '{}' (expected {}-{})",
+                ret.first, Base::name, min, max);
       // we ignore out-of-range values. an alternative would be to clamp them.
       // do we want to do that?
       ret.second = false;

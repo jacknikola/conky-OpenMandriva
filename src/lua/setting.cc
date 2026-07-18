@@ -47,8 +47,12 @@ settings_map *settings;
 
 /// Settings that have been removed. Maps old name to an explanation message.
 const std::unordered_map<std::string, std::string> removed_settings = {
-    {"own_window_argb_visual", "ARGB is now always enabled when available. Control opacity with `own_window_colour` (e.g. '#8000')."},
-    {"store_graph_data_explicitly", "Graph data is now always stored directly in the node; this setting has no effect."},
+    {"own_window_argb_visual",
+     "ARGB is now always enabled when available. Control opacity with "
+     "`own_window_colour` (e.g. '#8000')."},
+    {"store_graph_data_explicitly",
+     "Graph data is now always stored directly in the node; this setting has "
+     "no effect."},
 };
 
 /*
@@ -67,8 +71,7 @@ priv::config_setting_base *get_setting(lua::state &l, int index) {
   if (iter == settings->end()) {
     auto removed = removed_settings.find(name);
     if (removed != removed_settings.end()) {
-      LOG_WARNING("setting '{}' has been removed: {}", name,
-               removed->second);
+      LOG_WARNING("setting '{}' has been removed: {}", name, removed->second);
     } else {
       LOG_ERROR("unknown setting '{}'", name);
     }
@@ -81,6 +84,9 @@ priv::config_setting_base *get_setting(lua::state &l, int index) {
 const std::vector<std::string> settings_ordering{
     "display",
     "out_to_x",
+    // out_to_wayland must precede own_window: own_window's setter checks the
+    // active GUI output (out_to_gui) and disables itself when none is set yet.
+    "out_to_wayland",
     "use_xft",
     "font",
     "font0",
@@ -111,6 +117,7 @@ const std::vector<std::string> settings_ordering{
     "border_width",
     "alignment",
     "xinerama_head",
+    "lua_mouse_hook",
     "own_window_transparent",
     "own_window_class",
     "own_window_title",
@@ -119,7 +126,6 @@ const std::vector<std::string> settings_ordering{
     "own_window_colour",
     "own_window",
     "double_buffer",
-    "out_to_wayland",
     "imlib_cache_size",
 };
 
@@ -173,9 +179,7 @@ namespace priv {
 config_setting_base::config_setting_base(std::string name_)
     : name(std::move(name_)), seq_no(get_next_seq_no()) {
   bool inserted = settings->insert({name, this}).second;
-  if (!inserted) {
-    CRIT_ERR("setting '{}' already registered", name);
-  }
+  if (!inserted) { CRIT_ERR("setting '{}' already registered", name); }
 }
 
 config_setting_base::config_setting_base(config_setting_base &&other) noexcept
@@ -211,8 +215,10 @@ void config_setting_base::process_setting(lua::state &l, bool init) {
   if (ptr == nullptr) { return; }
 
   if (init && ptr->deprecation_msg.has_value() && !l.isnil(-2)) {
-    LOG_WARNING("'{}' is deprecated and will be removed in a future "
-             "release: {}", ptr->name, *ptr->deprecation_msg);
+    LOG_WARNING(
+        "'{}' is deprecated and will be removed in a future "
+        "release: {}",
+        ptr->name, *ptr->deprecation_msg);
   }
 
   ptr->lua_setter(l, init);

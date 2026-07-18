@@ -128,13 +128,14 @@ constexpr uint8_t operator*(window_type index) {
   return static_cast<uint8_t>(index);
 }
 
-#if defined(BUILD_X11) && defined(OWN_WINDOW)
-// Only works in X11 because Wayland doesn't support
-
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 /// @brief Hints are used to tell WM how it should treat a window.
 ///
-/// See: [X11 wm-spec `_NET_WM_STATE` property](
-/// https://specifications.freedesktop.org/wm-spec/1.3/ar01s05.html#idm45684324611552)
+/// On X11 these map onto the [wm-spec `_NET_WM_STATE` property](
+/// https://specifications.freedesktop.org/wm-spec/1.3/ar01s05.html#idm45684324611552).
+/// On Wayland there is no equivalent for toplevels, so they're translated into
+/// a wlr-layer-shell placement (e.g. `below`/`above` pick the layer, while
+/// `sticky`/`skip_taskbar`/`skip_pager` are intrinsic to layer surfaces).
 enum class window_hints : uint16_t {
   UNDECORATED = 0,
   BELOW,
@@ -187,18 +188,6 @@ void print_mouse_speed(struct text_object *, char *, unsigned int);
 
 extern conky::simple_config_setting<alignment> text_alignment;
 
-namespace priv {
-class own_window_setting : public conky::simple_config_setting<bool> {
-  typedef conky::simple_config_setting<bool> Base;
-
- protected:
-  virtual void lua_setter(lua::state &l, bool init);
-
- public:
-  own_window_setting() : Base("own_window", false, false) {}
-};
-}  // namespace priv
-
 extern conky::simple_config_setting<int> head_index;
 extern priv::colour_setting default_shade_color;
 extern priv::colour_setting default_outline_color;
@@ -209,19 +198,7 @@ extern conky::range_config_setting<int> border_width;
 
 extern conky::simple_config_setting<bool> forced_redraw;
 
-#ifdef OWN_WINDOW
-extern priv::own_window_setting own_window;
-extern conky::simple_config_setting<std::string> own_window_title;
-
-/// @brief Window type.
-///
-/// @see window_type
-extern conky::simple_config_setting<window_type> own_window_type;
-/// @brief X11 window class; Wayland XDG Shell app_id.
-extern conky::simple_config_setting<std::string> own_window_class;
-#endif /* OWN_WINDOW */
-
-#if defined(OWN_WINDOW) && defined(BUILD_X11)
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 struct window_hints_traits {
   static const lua::Type type = lua::TSTRING;
   typedef uint16_t Type;
@@ -230,9 +207,23 @@ struct window_hints_traits {
 };
 extern conky::simple_config_setting<uint16_t, window_hints_traits>
     own_window_hints;
-#endif /* OWN_WINDOW && BUILD_X11 */
+#endif /* OWN_WINDOW || BUILD_WAYLAND */
 
 #if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
+extern conky::simple_config_setting<bool> own_window;
+/// @brief X11 window title; Wayland XDG Shell toplevel title.
+extern conky::simple_config_setting<std::string> own_window_title;
+/// @brief X11 window class; Wayland XDG Shell app_id.
+extern conky::simple_config_setting<std::string> own_window_class;
+
+/// @brief Window type.
+///
+/// On Wayland this selects the wlr-layer-shell layer and, for dock/panel
+/// types, whether the surface reserves screen space via an exclusive zone.
+///
+/// @see window_type
+extern conky::simple_config_setting<window_type> own_window_type;
+
 extern priv::colour_setting background_colour;
 
 Colour get_background_colour_preference(lua::state &l);

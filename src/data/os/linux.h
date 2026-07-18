@@ -27,6 +27,12 @@
 
 #include "../../common.h"
 
+#include <iosfwd>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
 void print_disk_protect_queue(struct text_object *, char *, unsigned int);
 
 void print_ioscheduler(struct text_object *, char *, unsigned int);
@@ -48,7 +54,13 @@ void get_powerbook_batt_info(struct text_object *, char *, unsigned int);
 void parse_i2c_sensor(struct text_object *, const char *);
 void parse_hwmon_sensor(struct text_object *, const char *);
 void parse_platform_sensor(struct text_object *, const char *);
+
+void parse_i2c_bar(struct text_object *, const char *);
+void parse_hwmon_bar(struct text_object *, const char *);
+void parse_platform_bar(struct text_object *, const char *);
+
 void print_sysfs_sensor(struct text_object *, char *, unsigned int);
+double sysfs_sensor_barval(struct text_object *);
 void free_sysfs_sensor(struct text_object *);
 
 int get_entropy_avail(unsigned int *);
@@ -56,7 +68,24 @@ int get_entropy_poolsize(unsigned int *);
 
 int update_stat(void);
 
+// Maps a kernel CPU number to its 1-based slot in the per-core cpu usage arrays
+// given the ascending list of present CPU numbers, or -1 if not present. Slot 0
+// is the aggregate. Exposed for testing.
+int cpu_present_slot(const std::vector<int> &present, int cpu_number);
+
 void print_distribution(struct text_object *, char *, unsigned int);
+
+// Returns the value of `key` from a `KEY=VALUE` formatted stream (e.g. an
+// os-release file). Surrounding double quotes are stripped when present (the
+// spec allows unquoted values). Returns nullopt when the key is absent or its
+// value is empty.
+std::optional<std::string> get_kv_field(std::istream &in, std::string_view key);
+
+// Heuristically extracts a distribution name from a /proc/version line by
+// capturing the first parenthesised, uppercase-initial token. Returns nullopt
+// when no such token is found.
+std::optional<std::string> parse_distribution_from_proc_version(
+    const std::string &version);
 
 bool is_conky_already_running(void);
 

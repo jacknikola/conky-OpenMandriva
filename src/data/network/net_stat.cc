@@ -35,10 +35,10 @@
 #include <cerrno>
 #include <cstring>
 #include "../../conky.h"
-#include "../../logging.h"
-#include "net/if.h"
 #include "../../content/specials.h"
 #include "../../content/text_object.h"
+#include "../../logging.h"
+#include "net/if.h"
 #if defined(__sun)
 #include <sys/sockio.h>
 #endif
@@ -192,15 +192,33 @@ void parse_net_stat_arg(struct text_object *obj, const char *arg,
 
 void parse_net_stat_bar_arg(struct text_object *obj, const char *arg,
                             void *free_at_crash) {
-  if (arg != nullptr) {
-    arg = scan_bar(obj, arg, 1);
-    obj->data.opaque = get_net_stat(arg, obj, free_at_crash);
-  } else {
+  if (arg == nullptr) {
     // default to DEFAULTNETDEV
     char *buf = strndup(DEFAULTNETDEV, text_buffer_size.get(*state));
     obj->data.opaque = get_net_stat(buf, obj, free_at_crash);
     free(buf);
+    return;
   }
+
+  /* The interface name and bar dimensions may appear in either order.
+   * scan_command() yields the leading interface name for the documented
+   * "(net) (height),(width)" order (e.g. "wlp3s0 3,260", mirroring cpubar and
+   * the net speed graphs), and returns nullptr when the argument starts with a
+   * digit, i.e. when the "(height),(width)" spec comes first. Parsing the
+   * interface out first lets scan_bar see the dimensions regardless of order,
+   * so small heights are no longer dropped. */
+  auto [dev, skip] = scan_command(arg);
+  const char *rest = scan_bar(obj, arg + skip, 1);
+  if (dev == nullptr) { dev = scan_command(rest).first; }
+
+  if (dev != nullptr && dev[0] != '\0') {
+    obj->data.opaque = get_net_stat(dev, obj, free_at_crash);
+  } else {
+    char *buf = strndup(DEFAULTNETDEV, text_buffer_size.get(*state));
+    obj->data.opaque = get_net_stat(buf, obj, free_at_crash);
+    free(buf);
+  }
+  free(dev);
 }
 
 void print_downspeed(struct text_object *obj, char *p,
@@ -528,7 +546,7 @@ void free_if_up(struct text_object *obj) { free_and_zero(obj->data.opaque); }
 /* We should check if this is ok with OpenBSD and NetBSD as well. */
 int interface_up(struct text_object *obj) {
   int fd;
-  struct ifreq ifr {};
+  struct ifreq ifr{};
   auto *dev = static_cast<char *>(obj->data.opaque);
 
   if (dev == nullptr) { return 0; }
@@ -544,7 +562,9 @@ int interface_up(struct text_object *obj) {
   strncpy(ifr.ifr_name, dev, IFNAMSIZ);
   if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
     /* if device does not exist, treat like not up */
-    if (errno != ENODEV && errno != ENXIO) { LOG_ERROR("SIOCGIFFLAGS: {}", strerror(errno)); }
+    if (errno != ENODEV && errno != ENXIO) {
+      LOG_ERROR("SIOCGIFFLAGS: {}", strerror(errno));
+    }
     goto END_FALSE;
   }
 

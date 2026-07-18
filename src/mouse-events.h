@@ -21,8 +21,10 @@
 #ifndef MOUSE_EVENTS_H
 #define MOUSE_EVENTS_H
 
+#include <X11/Xlib.h>
 #include <bitset>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 
@@ -30,6 +32,7 @@
 
 #include "geometry.h"
 #include "logging.h"
+#include "lua/setting.hh"
 
 #ifdef BUILD_X11
 #include <array>
@@ -45,7 +48,7 @@ extern "C" {
 #include <X11/extensions/XInput.h>
 #include <X11/extensions/XInput2.h>
 #undef COUNT  // define from X11/extensions/Xi.h
-#endif /* BUILD_X11 */
+#endif        /* BUILD_X11 */
 
 #include <lua.h>
 
@@ -141,7 +144,7 @@ struct mouse_positioned_event : public mouse_event {
 
   mouse_positioned_event(mouse_event_t type, vec2<size_t> pos,
                          vec2<size_t> pos_absolute)
-      : mouse_event(type), pos(pos), pos_absolute(pos_absolute){};
+      : mouse_event(type), pos(pos), pos_absolute(pos_absolute) {};
 
   void push_lua_data(lua_State *L) const;
 };
@@ -180,7 +183,7 @@ struct mouse_move_event : public mouse_positioned_event {
   mouse_move_event(vec2<size_t> pos, vec2<size_t> pos_absolute,
                    modifier_state_t mods = 0)
       : mouse_positioned_event{mouse_event_t::MOVE, pos, pos_absolute},
-        mods(mods){};
+        mods(mods) {};
 
   void push_lua_data(lua_State *L) const;
 };
@@ -225,7 +228,7 @@ struct mouse_scroll_event : public mouse_positioned_event {
                      scroll_direction_t direction, modifier_state_t mods = 0)
       : mouse_positioned_event{mouse_event_t::SCROLL, pos, pos_absolute},
         direction(direction),
-        mods(mods){};
+        mods(mods) {};
 
   void push_lua_data(lua_State *L) const;
 };
@@ -239,7 +242,7 @@ struct mouse_button_event : public mouse_positioned_event {
                      modifier_state_t mods = 0)
       : mouse_positioned_event{type, pos, pos_absolute},
         button(button),
-        mods(mods){};
+        mods(mods) {};
 
   void push_lua_data(lua_State *L) const;
 };
@@ -252,8 +255,11 @@ struct mouse_crossing_event : public mouse_positioned_event {
 #endif /* BUILD_MOUSE_EVENTS */
 
 #ifdef BUILD_X11
-typedef int xi_device_id;
-typedef int xi_event_type;
+using xi_device_id = int;
+/// XInput2 event type
+///
+/// e.g. `XI_KeyPress`
+using xi_event_type = int;
 
 enum class valuator_t : size_t { MOVE_X, MOVE_Y, SCROLL_X, SCROLL_Y, UNKNOWN };
 const size_t VALUATOR_COUNT = static_cast<size_t>(valuator_t::UNKNOWN);
@@ -261,14 +267,39 @@ constexpr uint8_t operator*(valuator_t index) {
   return static_cast<uint8_t>(index);
 }
 
+class xi_event_bitflags {
+  std::array<unsigned char, (XI_LASTEVENT + 7) / 8> data = {0};
+
+ public:
+  constexpr void set(xi_event_type event) {
+    data[(event) >> 3] |= (1 << ((event) & 7));
+  }
+  constexpr void clear(xi_event_type event) {
+    data[(event) >> 3] &= ~(1 << ((event) & 7));
+  }
+  void clear_all() { std::memset(data.data(), 0, data.size()); }
+  constexpr bool test(xi_event_type event) const {
+    return static_cast<bool>(data[(event) >> 3] & (1 << ((event) & 7)));
+  }
+  constexpr size_t size() const { return data.size(); }
+
+  XIEventMask mask(xi_device_id device) const {
+    return XIEventMask{
+        device,
+        static_cast<int>(data.size()),
+        const_cast<unsigned char *>(data.data()),
+    };
+  }
+};
+
 struct conky_valuator_info {
   size_t index = SIZE_MAX;
   double min = 0.0;
   double max = 0.0;
   double value = 0.0;
   bool relative = false;
-  /// Scroll increment from XIScrollClassInfo; sign defines direction convention.
-  /// Positive means increasing valuator value = down/right.
+  /// Scroll increment from XIScrollClassInfo; sign defines direction
+  /// convention. Positive means increasing valuator value = down/right.
   double increment = 1.0;
 };
 
@@ -290,27 +321,65 @@ struct device_info {
 
 void handle_xi_device_change(const XIHierarchyEvent *event);
 
-/// Almost an exact copy of `XIDeviceEvent`, except it owns all data.
-struct xi_event_data {
+/// `XIEvent` header, removed constant data.
+struct xi_event_base {
+  /// XI2 event type
+  ///
+  /// e.g. `XI_KeyPress`
   xi_event_type evtype;
+  /// Serial number of last request processed by server
   unsigned long serial;
+  /// True if the event came from a `SendEvent` request.
   Bool send_event;
+  /// Display the event was read from
   Display *display;
   /// XI extension offset
-  // TODO: Check whether this is consistent between different clients by
-  // printing.
   int extension;
+  /// X server timestamp of the event
   Time time;
+
+  virtual bool read_from_cookie(Display *display, const void *data);
+
+  virtual std::vector<std::tuple<int, XEvent *>> generate_events(
+      Window target, Window child, conky::vec2d target_pos) const {
+    return std::vector<std::tuple<int, XEvent *>>();
+  }
+};
+
+#define GENERATES_EVENTS                                  \
+  std::vector<std::tuple<int, XEvent *>> generate_events( \
+      Window target, Window child, conky::vec2d target_pos) const override;
+
+struct xi_pointer_event : public xi_event_base {
   device_info *device;
   int sourceid;
   int detail;
+  /// Root window owning the `event` and `child` windows.
   Window root;
+  /// Window that registered the event listener.
   Window event;
+  /// Direct descendant of `event` whoose child (or itself) got the event.
+  ///
+  /// This is not the "final" child that actually got the event, just the
+  /// direct descendant of `event`.
+  ///
+  /// You need `XQueryPointer` to get the actual leaf window that recieved
+  /// the event. `child` is sufficient in most cases though.
+  ///
+  /// When `child == event`, the value is `None`.
   Window child;
+  /// `display` relative event coordinates
   conky::vec2d pos_absolute;
+  /// `event` window relative event coordinates
   conky::vec2d pos;
+
+  virtual bool read_from_cookie(Display *display, const void *data) override;
+};
+
+/// Almost an exact copy of `XIDeviceEvent`, except it owns all data.
+struct xi_pointer_interact_event : public xi_pointer_event {
   int flags;
-  /// pressed button mask
+  /// Pressed button mask
   std::bitset<32> buttons;
   std::map<size_t, double> valuators;
   XIModifierState mods;
@@ -319,20 +388,59 @@ struct xi_event_data {
   // Extra data
 
   /// Precomputed relative values
-  std::array<double, VALUATOR_COUNT> valuators_relative;
+  std::array<double, VALUATOR_COUNT> valuators_relative{};
 
-  static xi_event_data *read_cookie(Display *display, const void *data);
+  bool read_from_cookie(Display *display, const void *data) override;
 
   bool test_valuator(valuator_t id) const;
   conky_valuator_info *valuator_info(valuator_t id) const;
   std::optional<double> valuator_value(valuator_t id) const;
   std::optional<double> valuator_relative_value(valuator_t valuator) const;
-
-  std::vector<std::tuple<int, XEvent *>> generate_events(
-      Window target, Window child, conky::vec2d target_pos) const;
 };
 
+struct xi_pointer_move final : public xi_pointer_interact_event {
+  GENERATES_EVENTS
+};
+struct xi_pointer_press final : public xi_pointer_interact_event {
+  GENERATES_EVENTS
+};
+struct xi_pointer_release final : public xi_pointer_interact_event {
+  GENERATES_EVENTS
+};
+
+/// Almost an exact copy of `XIEnterEvent`, except it owns all data.
+struct xi_pointer_crossing_event : public xi_pointer_event {
+  int mode;
+  Bool focus;
+  Bool same_screen;
+  /// Pressed button mask
+  std::bitset<32> buttons;
+  XIModifierState mods;
+  XIGroupState group;
+
+  bool read_from_cookie(Display *display, const void *data) override;
+};
+
+struct xi_pointer_enter final : public xi_pointer_crossing_event {
+  GENERATES_EVENTS
+};
+struct xi_pointer_leave final : public xi_pointer_crossing_event {
+  GENERATES_EVENTS
+};
+// Focus events are sink-only: they're never propagated, so they inherit
+// `xi_event_base::generate_events` (which yields nothing) instead of
+// overriding it.
+struct xi_pointer_focus_in final : public xi_pointer_crossing_event {};
+struct xi_pointer_focus_out final : public xi_pointer_crossing_event {};
+
+#undef GENERATES_EVENTS
+
 #endif /* BUILD_X11 */
+
+#ifdef BUILD_MOUSE_EVENTS
+extern simple_config_setting<std::string> lua_mouse_hook;
+#endif
+
 }  // namespace conky
 
 #endif /* MOUSE_EVENTS_H */

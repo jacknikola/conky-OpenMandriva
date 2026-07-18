@@ -28,9 +28,9 @@
  */
 #include "gui.h"
 #include "../common.h"
-#include "config.h"
 #include "../conky.h"
 #include "../logging.h"
+#include "config.h"
 
 #ifdef BUILD_X11
 #include "../lua/x11-settings.h"
@@ -52,11 +52,6 @@ conky::absolute_rect<int> workarea;
 /* Window stuff */
 char window_created = 0;
 
-/* local prototypes */
-#ifdef BUILD_X11
-void x11_init_window(lua::state &l, bool own);
-#endif /*BUILD_X11*/
-
 /********************* <SETTINGS> ************************/
 
 bool out_to_gui(lua::state &l) {
@@ -69,36 +64,6 @@ bool out_to_gui(lua::state &l) {
 #endif /* BUILD_WAYLAND */
   return to_gui;
 }
-
-namespace priv {
-void own_window_setting::lua_setter(lua::state &l, bool init) {
-  lua::stack_sentry s(l, -2);
-
-  Base::lua_setter(l, init);
-
-  if (init) {
-    if (do_convert(l, -1).first) {
-#ifndef OWN_WINDOW
-      LOG_WARNING("own_window support disabled at compile time, ignoring setting");
-      l.pop();
-      l.pushboolean(false);
-#endif
-    }
-
-    if (out_to_gui(l)) {
-#ifdef BUILD_X11
-      x11_init_window(l, do_convert(l, -1).first);
-#endif /*BUILD_X11*/
-    } else {
-      // own_window makes no sense when not drawing to X
-      l.pop();
-      l.pushboolean(false);
-    }
-  }
-
-  ++s;
-}
-}  // namespace priv
 
 template <>
 conky::lua_traits<alignment>::Map conky::lua_traits<alignment>::map = {
@@ -127,13 +92,19 @@ conky::lua_traits<alignment>::Map conky::lua_traits<alignment>::map = {
     {"mr", alignment::MIDDLE_RIGHT},
     {"none", alignment::NONE}};
 
-#ifdef OWN_WINDOW
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 template <>
 conky::lua_traits<window_type>::Map conky::lua_traits<window_type>::map = {
-    {"normal", window_type::NORMAL},   {"dock", window_type::DOCK},
-    {"panel", window_type::PANEL},     {"desktop", window_type::DESKTOP},
-    {"utility", window_type::UTILITY}, {"override", window_type::OVERRIDE}};
+    {"normal", window_type::NORMAL},     {"dock", window_type::DOCK},
+    {"panel", window_type::PANEL},       {"desktop", window_type::DESKTOP},
+    {"utility", window_type::UTILITY},
+#ifdef BUILD_X11
+    {"override", window_type::OVERRIDE},
+#endif /* BUILD_X11 */
+};
+#endif /* OWN_WINDOW || BUILD_WAYLAND */
 
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 template <>
 conky::lua_traits<window_hints>::Map conky::lua_traits<window_hints>::map = {
     {"undecorated", window_hints::UNDECORATED},
@@ -166,9 +137,9 @@ std::pair<uint16_t, bool> window_hints_traits::convert(
   }
   return {ret, true};
 }
-#endif
+#endif /* OWN_WINDOW || BUILD_WAYLAND */
 
-#ifdef OWN_WINDOW
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 namespace {
 // used to set the default value for own_window_title
 std::string gethostnamecxx() {
@@ -176,7 +147,7 @@ std::string gethostnamecxx() {
   return info.uname_s.nodename;
 }
 }  // namespace
-#endif /* OWN_WINDOW */
+#endif /* OWN_WINDOW || BUILD_WAYLAND */
 
 /*
  * The order of these settings cannot be completely arbitrary. Some of them
@@ -205,20 +176,23 @@ conky::range_config_setting<int> border_width("border_width", 0,
                                               std::numeric_limits<int>::max(),
                                               1, true);
 
-#ifdef OWN_WINDOW
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 conky::simple_config_setting<std::string> own_window_title(
     "own_window_title", PACKAGE_NAME " (" + gethostnamecxx() + ")", false);
+conky::simple_config_setting<std::string> own_window_class("own_window_class",
+                                                           PACKAGE_NAME, false);
+#endif /* OWN_WINDOW || BUILD_WAYLAND */
+
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 conky::simple_config_setting<window_type> own_window_type("own_window_type",
                                                           window_type::NORMAL,
                                                           false);
-conky::simple_config_setting<std::string> own_window_class("own_window_class",
-                                                           PACKAGE_NAME, false);
-#endif /* OWN_WINDOW */
+#endif /* OWN_WINDOW || BUILD_WAYLAND */
 
-#if defined(OWN_WINDOW) && defined(BUILD_X11)
+#if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 conky::simple_config_setting<uint16_t, window_hints_traits> own_window_hints(
     "own_window_hints", 0, false);
-#endif /* OWN_WINDOW && BUILD_X11 */
+#endif /* OWN_WINDOW || BUILD_WAYLAND */
 
 #if defined(OWN_WINDOW) || defined(BUILD_WAYLAND)
 priv::colour_setting background_colour("own_window_colour", 0);
@@ -238,14 +212,12 @@ Colour get_background_colour_preference(lua::state &l) {
   if (own_window_argb_value.get(l) < 0xff) {
     background.alpha = own_window_argb_value.get(l);
   }
-  if (set_transparent.get(l)) {
-    background.alpha = 0;
-  }
+  if (set_transparent.get(l)) { background.alpha = 0; }
 
   return background;
 }
 #endif /* OWN_WINDOW || BUILD_WAYLAND */
 
-priv::own_window_setting own_window;
+conky::simple_config_setting<bool> own_window("own_window", false, false);
 
 /******************** </SETTINGS> ************************/
