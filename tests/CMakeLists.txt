@@ -24,7 +24,60 @@ target_link_libraries(test-conky
   PRIVATE Catch2
   PUBLIC conky_core
 )
+if(BUILD_X11 AND BUILD_XFT)
+  # The Xft raster test queries the drawable's Render format directly.
+  target_link_libraries(test-conky PRIVATE ${X11_Xrender_LIB})
+endif()
 catch_discover_tests(test-conky)
+
+if(BUILD_X11)
+  # Catch2 discovers tests after configuration. Apply the display lock once
+  # those tests exist, without serializing the rest of the Catch2 suite.
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/x11-test-properties.cmake"
+    CONTENT [=[
+foreach(x11_case x11_foreground_alpha x11_input_alpha x11_input_alpha_images x11_xft_color x11_xft_reload)
+  list(FIND test-conky_TESTS ${x11_case} x11_case_index)
+  if(NOT x11_case_index EQUAL -1)
+    set_tests_properties(${x11_case} PROPERTIES
+      TIMEOUT 30 LABELS "integration;x11" RESOURCE_LOCK x11_test_display)
+  endif()
+endforeach()
+]=])
+  set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/x11-test-properties.cmake")
+
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_dependencies(test-conky conky)
+    add_test(NAME x11_startup_fallback
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test-x11-startup.py $<TARGET_FILE:conky>)
+    set_tests_properties(x11_startup_fallback PROPERTIES
+      TIMEOUT 45 LABELS "integration;x11")
+
+    if(OWN_WINDOW)
+      add_executable(x11-test-probe x11-test-probe.cc)
+      target_link_libraries(x11-test-probe PRIVATE ${X11_LIBRARIES})
+      add_dependencies(test-conky x11-test-probe)
+      add_test(NAME x11_reload
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/test-x11-reload.py
+          $<TARGET_FILE:conky> $<TARGET_FILE:x11-test-probe>)
+      set_tests_properties(x11_reload PROPERTIES
+        TIMEOUT 90 SKIP_RETURN_CODE 77 LABELS "integration;x11"
+        RESOURCE_LOCK x11_test_display)
+      if(BUILD_XFT)
+        add_test(NAME x11_reload_xft
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test-x11-reload.py
+            $<TARGET_FILE:conky> $<TARGET_FILE:x11-test-probe>)
+        set_tests_properties(x11_reload_xft PROPERTIES
+          TIMEOUT 90 SKIP_RETURN_CODE 77 LABELS "integration;x11"
+          RESOURCE_LOCK x11_test_display ENVIRONMENT "CONKY_TEST_X11_XFT=1")
+      endif()
+    endif()
+  endif()
+endif()
 
 if(RUN_TESTS)
   add_custom_command(TARGET test-conky

@@ -29,6 +29,10 @@
 #cmakedefine HAVE_SYS_INOTIFY_H 1
 #cmakedefine HAVE_DIRENT_H 1
 
+#cmakedefine HAVE_UTMP 1
+#cmakedefine HAVE_SYSTEMD 1
+#cmakedefine HAVE_SYSTEMD_LOGIN_TIME 1
+
 #cmakedefine HAVE_SOUNDCARD_H 1
 
 #cmakedefine HAVE_STRNDUP 1
@@ -45,8 +49,18 @@
 #cmakedefine HAVE_XCB_ERRORS 1
 
 #cmakedefine BUILD_WAYLAND 1
+#ifdef BUILD_WAYLAND
+constexpr bool BUILD_WAYLAND_V = true;
+#else
+constexpr bool BUILD_WAYLAND_V = false;
+#endif
 
 #cmakedefine BUILD_X11 1
+#ifdef BUILD_X11
+constexpr bool BUILD_X11_V = true;
+#else
+constexpr bool BUILD_X11_V = false;
+#endif
 
 #cmakedefine OWN_WINDOW 1
 
@@ -86,8 +100,6 @@
 
 #cmakedefine BUILD_HDDTEMP 1
 
-#cmakedefine BUILD_LIBXML2 1
-
 #cmakedefine BUILD_CURL 1
 
 #cmakedefine BUILD_IMLIB2 1
@@ -100,6 +112,11 @@
 
 #cmakedefine BUILD_NCURSES 1
 #cmakedefine LEAKFREE_NCURSES 1
+#ifdef BUILD_NCURSES
+constexpr bool BUILD_NCURSES_V = true;
+#else
+constexpr bool BUILD_NCURSES_V = false;
+#endif
 
 #cmakedefine BUILD_APCUPSD 1
 
@@ -120,6 +137,11 @@
 #cmakedefine BUILD_IPV6 1
 
 #cmakedefine BUILD_HTTP 1
+#ifdef BUILD_HTTP
+constexpr bool BUILD_HTTP_V = true;
+#else
+constexpr bool BUILD_HTTP_V = false;
+#endif
 
 #cmakedefine BUILD_GUI 1
 
@@ -142,8 +164,6 @@
 #cmakedefine BUILD_CMUS 1
 
 #cmakedefine BUILD_JOURNAL 1
-
-#cmakedefine BUILD_HSV_GRADIENT 1
 
 #cmakedefine BUILD_COLOUR_NAME_MAP 1
 

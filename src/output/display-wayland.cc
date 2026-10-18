@@ -35,6 +35,7 @@
 #include <pango/pangofc-fontmap.h>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
@@ -51,6 +52,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <memory>
 
 #include "../conky.h"
@@ -59,6 +61,7 @@
 #include "../lua/llua.h"
 #include "display-output.hh"
 #include "gui.h"
+#include "output-setting.hh"
 #include "wl-shell.h"
 
 #include "../lua/fonts.h"
@@ -152,9 +155,22 @@ static int os_create_anonymous_file(off_t size) {
   if (fd < 0) return -1;
   ret = posix_fallocate(fd, 0, size);
   if (ret != 0) {
-    close(fd);
-    errno = ret;
-    return -1;
+    if (ret == EOPNOTSUPP || ret == ENOSYS || ret == ENOTSUP) {
+      /* posix_fallocate() is unsupported on this platform or filesystem (e.g.
+       * FreeBSD/ZFS). Fall back to ftruncate(), which may yield SIGBUS on
+       * mmap()'ed access if disk space is overcommitted. */
+      if (ftruncate(fd, size) != 0) {
+        int trunc_errno = errno;
+        close(fd);
+        LOG_ERROR("ftruncate failed: {}", strerror(trunc_errno));
+        errno = trunc_errno;
+        return -1;
+      }
+    } else {
+      close(fd);
+      errno = ret;
+      return -1;
+    }
   }
   return fd;
 }
@@ -193,37 +209,13 @@ struct pango_font {
 
 static std::vector<pango_font> pango_fonts; /* indexed by selected_font */
 
-namespace {
-class textalpha_setting : public conky::simple_config_setting<float> {
-  using Base = conky::simple_config_setting<float>;
-
- protected:
-  void lua_setter(lua::state &l, bool init) override {
-    lua::stack_sentry s(l, -2);
-
-    Base::lua_setter(l, init);
-
-    if (init) {
-      pango_fonts.resize(std::max(1, static_cast<int>(fonts.size())));
-      pango_fonts[0].desc = nullptr;
-      pango_fonts[0].font_alpha = do_convert(l, -1).first * 0xffff;
-    }
-
-    ++s;
-  }
-
- public:
-  textalpha_setting() : Base("textalpha", 1.0, false) {}
-};
-
-textalpha_setting textalpha;
-}  // namespace
-
 static void wayland_create_window();
 
 static void wayland_create_window() {
-  setup_fonts();
+  // Load before setup: setup_fonts() forwards set_font(0), which warns (or
+  // asserts in debug) when the backend cache is still empty.
   load_fonts(utf8_mode.get(*state));
+  setup_fonts();
   update_text_area(); /* to position text/window on screen */
 
   selected_font = 0;
@@ -235,22 +227,9 @@ namespace {
 conky::display_output_wayland wayland_output;
 }  // namespace
 
-template <>
-void register_output<output_t::WAYLAND>(display_outputs_t &outputs) {
-  outputs.push_back(&wayland_output);
-}
-
 display_output_wayland::display_output_wayland()
-    : display_output_base("wayland") {
+    : display_output_base("wayland", output_t::WAYLAND) {
   is_graphical = true;
-}
-
-bool display_output_wayland::detect() {
-  if (out_to_wayland.get(*state)) {
-    LOG_DEBUG("wayland display output '{}' enabled in config", name);
-    return true;
-  }
-  return false;
 }
 
 static int epoll_fd;
@@ -283,6 +262,12 @@ struct window {
   /// when the window is reallocated (see window_resize).
   float pending_scale = 1.0f;
   int current_buffer;
+  /// @brief Consecutive frames dropped because the compositor held both
+  /// buffers (see window_commit_buffer).
+  int skipped_frames = 0;
+  /// @brief Consecutive commits where the other buffer's release never came
+  /// (see window_commit_buffer).
+  int missed_releases = 0;
   std::shared_ptr<cairo_surface_t> shm_surface[2];
   std::unique_ptr<uint8_t[]> private_buffer;
   std::shared_ptr<cairo_surface_t> cairo_surface;
@@ -696,6 +681,11 @@ bool display_output_wayland::initialize() {
       !hints_require_layer_shell();
   auto on_close = []() { g_sigterm_pending = 1; };
 
+  // KWin classifies the layer-shell surface from its namespace. Keep the
+  // classic namespace unless the user opts into another via
+  // own_window_namespace, so existing configs are unaffected.
+  std::string namespace_str = own_window_namespace.get(*state);
+
   if (!hints_layer_shell && wl_globals.layer_shell != nullptr) {
     global_window->shell =
         conky::create_shell_surface<conky::layer_shell_surface>({
@@ -703,7 +693,7 @@ bool display_output_wayland::initialize() {
             global_window->surface,
             wl_globals.layer_shell,
             static_cast<uint32_t>(layer_for_window()),
-            "conky",
+            namespace_str.c_str(),
         });
   } else {
     if (!hints_layer_shell) {
@@ -1105,6 +1095,10 @@ void display_output_wayland::load_fonts(bool utf8) {
     pango_font_entry.metrics.ascent = ascent;
     pango_font_entry.metrics.descent = descent;
   }
+  if (!pango_fonts.empty()) {
+    pango_fonts[0].font_alpha =
+        static_cast<int>(text_alpha.get(*state) * 0xffff);
+  }
 }
 
 struct shm_pool {
@@ -1151,6 +1145,57 @@ static void shm_surface_data_destroy(void *p) {
   wl_display_roundtrip(global_display);
 
   delete data;
+}
+
+static shm_surface_data *get_shm_surface_data(cairo_surface_t *surface) {
+  if (surface == nullptr) return nullptr;
+  return static_cast<shm_surface_data *>(
+      cairo_surface_get_user_data(surface, &shm_surface_data_key));
+}
+
+static bool shm_surface_busy(const std::shared_ptr<cairo_surface_t> &surface) {
+  auto *data = get_shm_surface_data(surface.get());
+  return data != nullptr && data->busy;
+}
+
+// Wait up to timeout_ms for wl_buffer.release. Returns true if it came.
+// Don't loop on wl_display_dispatch() here: if the compositor sits on the
+// buffer (KWin does this now and then) conky hangs forever.
+static bool wait_for_buffer_release(shm_surface_data *data, int timeout_ms) {
+  if (data == nullptr || !data->busy) return true;
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  while (data->busy) {
+    while (wl_display_prepare_read(global_display) != 0) {
+      if (wl_display_dispatch_pending(global_display) == -1) return false;
+    }
+    if (!data->busy) {
+      wl_display_cancel_read(global_display);
+      break;
+    }
+    wl_display_flush(global_display);
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed = (now.tv_sec - start.tv_sec) * 1000 +
+                   (now.tv_nsec - start.tv_nsec) / 1000000;
+    int remaining = timeout_ms - static_cast<int>(elapsed);
+    if (remaining <= 0) {
+      wl_display_cancel_read(global_display);
+      return false;
+    }
+
+    pollfd pfd = {wl_display_get_fd(global_display), POLLIN, 0};
+    int ready = poll(&pfd, 1, remaining);
+    if (ready > 0) {
+      if (wl_display_read_events(global_display) == -1) return false;
+    } else {
+      wl_display_cancel_read(global_display);
+      if (ready < 0 && errno != EINTR) return false;
+    }
+    if (wl_display_dispatch_pending(global_display) == -1) return false;
+  }
+  return true;
 }
 
 static wl_shm_pool *make_shm_pool(wl_shm *shm, int size, void **data) {
@@ -1244,7 +1289,19 @@ static std::shared_ptr<conky::draw_surface> create_shm_surface_from_pool(
   cairo_format = CAIRO_FORMAT_ARGB32; /*or CAIRO_FORMAT_RGB16_565 who knows??*/
 
   stride = stride_for_shm_surface(rectangle, scale);
+  if (stride < 0) {
+    LOG_ERROR("invalid buffer width {} for {}x{} window", stride,
+              rectangle->width(), rectangle->height());
+    delete data;
+    return nullptr;
+  }
   length = data_length_for_shm_surface(rectangle, scale);
+  if (length <= 0) {
+    LOG_ERROR("invalid buffer size {} for {}x{} window", length,
+              rectangle->width(), rectangle->height());
+    delete data;
+    return nullptr;
+  }
   data->pool = NULL;
   map = shm_pool_allocate(pool, length, &offset);
 
@@ -1258,8 +1315,23 @@ static std::shared_ptr<conky::draw_surface> create_shm_surface_from_pool(
       static_cast<unsigned char *>(map), cairo_format, scaled.x(), scaled.y(),
       stride);
 
-  cairo_surface_set_user_data(surface, &shm_surface_data_key, data,
-                              shm_surface_data_destroy);
+  if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+    LOG_ERROR("cairo image surface creation failed: {}",
+              cairo_status_to_string(cairo_surface_status(surface)));
+    cairo_surface_destroy(surface);
+    delete data;
+    return nullptr;
+  }
+
+  if (cairo_surface_set_user_data(surface, &shm_surface_data_key, data,
+                                  shm_surface_data_destroy) !=
+      CAIRO_STATUS_SUCCESS) {
+    LOG_ERROR("cairo_surface_set_user_data failed for {}x{} window",
+              rectangle->width(), rectangle->height());
+    cairo_surface_destroy(surface);
+    delete data;
+    return nullptr;
+  }
 
   format = WL_SHM_FORMAT_ARGB8888; /*or WL_SHM_FORMAT_RGB565*/
 
@@ -1273,9 +1345,9 @@ static std::shared_ptr<conky::draw_surface> create_shm_surface_from_pool(
   });
 }
 
-void window_allocate_buffer(window *window) {
-  assert(window->shm != nullptr);
-
+// Creates the two wl_shm buffers that frames are copied into before commit.
+// On failure the window keeps whatever buffers it had.
+static bool window_allocate_shm_buffers(window *window) {
   float scale = window->scale;
   shm_pool *pool;
   pool = shm_pool_create(
@@ -1283,19 +1355,20 @@ void window_allocate_buffer(window *window) {
   if (!pool) {
     LOG_ERROR("could not allocate shm pool for {}x{} window",
               window->rectangle.width(), window->rectangle.height());
-    return;
+    return false;
   }
+  std::shared_ptr<cairo_surface_t> fresh[2];
   for (int i = 0; i < 2; ++i) {
-    window->shm_surface[i] = create_shm_surface_from_pool(
-        window->shm, &window->rectangle, pool, scale);
+    fresh[i] = create_shm_surface_from_pool(window->shm, &window->rectangle,
+                                            pool, scale);
 
-    if (!window->shm_surface[i]) {
-      if (i == 1) { window->shm_surface[0] = nullptr; }
+    if (!fresh[i]) {
+      fresh[0] = nullptr;
       shm_pool_destroy(pool);
-      return;
+      return false;
     }
 
-    auto cs = window->shm_surface[i].get();
+    auto cs = fresh[i].get();
     cairo_surface_set_device_scale(cs, scale, scale);
 
     /* make sure we destroy the pool when the surface is destroyed */
@@ -1303,7 +1376,19 @@ void window_allocate_buffer(window *window) {
         cairo_surface_get_user_data(cs, &shm_surface_data_key));
     data->pool = (i == 1) ? pool : nullptr;
   }
+  window->shm_surface[0] = std::move(fresh[0]);
+  window->shm_surface[1] = std::move(fresh[1]);
   window->current_buffer = 0;
+  window->skipped_frames = 0;
+  window->missed_releases = 0;
+  return true;
+}
+
+void window_allocate_buffer(window *window) {
+  assert(window->shm != nullptr);
+
+  float scale = window->scale;
+  if (!window_allocate_shm_buffers(window)) return;
 
   int stride = stride_for_shm_surface(&window->rectangle, scale);
   int length = data_length_for_shm_surface(&window->rectangle, scale);
@@ -1399,6 +1484,40 @@ void window_resize(window *window, int width, int height) {
 void window_commit_buffer(window *window) {
   assert(window->shm_surface[window->current_buffer] != nullptr);
 
+  // Don't wait on the compositor forever. Use whichever buffer is free. If
+  // both are held, skip this frame, and after a few skips just make new
+  // buffers. Same if one buffer keeps missing its release while the other
+  // one works, otherwise every frame eats the full wait below.
+  constexpr int kMaxSkippedFrames = 3;
+  if (window->missed_releases > kMaxSkippedFrames) {
+    LOG_WARNING("compositor keeps holding a buffer, reallocating them");
+    if (!window_allocate_shm_buffers(window)) window->missed_releases = 0;
+  }
+  if (shm_surface_busy(window->shm_surface[window->current_buffer])) {
+    wait_for_buffer_release(
+        get_shm_surface_data(window->shm_surface[window->current_buffer].get()),
+        50);
+  }
+  if (shm_surface_busy(window->shm_surface[window->current_buffer]) &&
+      !shm_surface_busy(window->shm_surface[1 - window->current_buffer])) {
+    window->current_buffer = 1 - window->current_buffer;
+  }
+  if (shm_surface_busy(window->shm_surface[window->current_buffer])) {
+    if (++window->skipped_frames <= kMaxSkippedFrames) {
+      LOG_WARNING("compositor holds both buffers, skipping frame ({}/{})",
+                  window->skipped_frames, kMaxSkippedFrames);
+      wl_display_flush(global_display);
+      return;
+    }
+    LOG_WARNING("compositor never released buffers, reallocating them");
+    if (!window_allocate_shm_buffers(window)) {
+      // Keep the old buffers and try again in a few frames.
+      window->skipped_frames = 0;
+      return;
+    }
+  }
+  window->skipped_frames = 0;
+
   cairo_surface_flush(window->cairo_surface.get());
 
   float scale = window->scale;
@@ -1432,10 +1551,17 @@ void window_commit_buffer(window *window) {
       cairo_surface_get_user_data(shm_surf, &shm_surface_data_key));
   data->busy = true;
   window->current_buffer = 1 - window->current_buffer;
-  auto next_surf = window->shm_surface[window->current_buffer].get();
-  shm_surface_data *next_data = static_cast<shm_surface_data *>(
-      cairo_surface_get_user_data(next_surf, &shm_surface_data_key));
-  while (next_data->busy) { wl_display_dispatch(global_display); }
+  // Still eat the release here (with a timeout). If it's left for
+  // main_loop_wait() it wakes epoll every frame, update_text() never runs, and
+  // the text goes stale.
+  if (wait_for_buffer_release(
+          get_shm_surface_data(
+              window->shm_surface[window->current_buffer].get()),
+          200)) {
+    window->missed_releases = 0;
+  } else {
+    ++window->missed_releases;
+  }
 }
 
 void window_get_width_height(window *window, int *w, int *h) {

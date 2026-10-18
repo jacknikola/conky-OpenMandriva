@@ -39,9 +39,12 @@
 #include <unistd.h>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
+#include <optional>
 #include <vector>
 
 #include "config.h"
@@ -132,7 +135,7 @@ int update_uname() {
 }
 
 double get_time() {
-  struct timespec tv{};
+  struct timespec tv {};
 #ifdef _POSIX_MONOTONIC_CLOCK
   clock_gettime(CLOCK_MONOTONIC, &tv);
 #else
@@ -147,7 +150,7 @@ double get_time() {
  * align the update schedule to real-second boundaries so that displayed clocks
  * (e.g. ${time}) tick on the wall second instead of lagging by that offset. */
 double get_realtime() {
-  struct timespec tv{};
+  struct timespec tv {};
   clock_gettime(CLOCK_REALTIME, &tv);
   return tv.tv_sec + (tv.tv_nsec * 1e-9);
 }
@@ -431,6 +434,33 @@ conky::simple_config_setting<std::string> bar_unfill("console_bar_unfill", ".",
 conky::simple_config_setting<std::string> github_token("github_token", "",
                                                        false);
 
+std::size_t scan_cpu_index(const char *str) {
+  if (str == nullptr || *str == '\0') { return 1; }
+  const char *end = str + std::strlen(str);
+
+  while (str != end && std::isspace(static_cast<unsigned char>(*str))) {
+    ++str;
+  }
+  if (str == end) { return 1; }
+
+  std::size_t result;
+  auto [ptr, error_const] = std::from_chars(str, end, result);
+  while (ptr != end && std::isspace(static_cast<unsigned char>(*ptr))) {
+    ++ptr;
+  }
+
+  bool valid = error_const == std::errc{} &&
+               ptr == end &&  // consume entire string
+               result >= 1 && result <= info.cpu_count;
+
+  if (!valid) {
+    LOG_WARNING("invalid CPU number '{}', falling back to CPU 1", str);
+    return 1;
+  }
+
+  return result;
+}
+
 void update_stuff() {
   /* clear speeds, addresses and up status in case device was removed and
    *  doesn't get updated */
@@ -500,7 +530,46 @@ void print_loadavg(struct text_object *obj, char *p, unsigned int p_max_size) {
 
 void scan_no_update(struct text_object *obj, const char *arg) {
   obj->data.s = static_cast<char *>(malloc(text_buffer_size.get(*state)));
-  evaluate(arg, obj->data.s, text_buffer_size.get(*state));
+  {
+    temporary_specials guard;
+    evaluate(arg, obj->data.s, text_buffer_size.get(*state));
+  }
+
+  /* Specials evaluated at scan time cannot work: their special nodes are
+   * reused/overwritten by the first generate_text() pass, while the cached
+   * SPECIAL_CHAR markers keep desyncing the specials list. Strip them. */
+  char *src = obj->data.s;
+  char *dst = obj->data.s;
+  bool stripped = false;
+  while (*src != 0) {
+    if (*src == SPECIAL_CHAR) {
+      stripped = true;
+    } else {
+      *dst++ = *src;
+    }
+    src++;
+  }
+  *dst = 0;
+  if (stripped) {
+    // eval/execp can scan this every update. Keep one warning per
+    // configuration, including nested evaluations, and allow it again after a
+    // config reload.
+    static char warning_key;
+    lua::stack_sentry restore_stack(*state);
+    state->checkstack(2);
+    state->pushlightuserdata(&warning_key);
+    state->rawget(lua::REGISTRYINDEX);
+    if (!state->toboolean(-1)) {
+      state->pop();
+      state->pushlightuserdata(&warning_key);
+      state->pushboolean(true);
+      state->rawset(lua::REGISTRYINDEX);
+      LOG_WARNING(
+          "$no_update does not support special objects (e.g. ${color}); "
+          "they are ignored");
+    }
+  }
+
   obj->data.s =
       static_cast<char *>(realloc(obj->data.s, strlen(obj->data.s) + 1));
 }
@@ -769,20 +838,16 @@ void free_acpitemp(struct text_object *obj) { close(obj->data.i); }
 #endif /* !__OpenBSD__ */
 
 void print_freq(struct text_object *obj, char *p, unsigned int p_max_size) {
-  static int ok = 1;
-  if (ok != 0) { ok = get_freq(p, p_max_size, "%.0f", 1, obj->data.i); }
+  get_freq(p, p_max_size, "%.0f", 1, obj->data.i);
 }
 
 void print_freq_g(struct text_object *obj, char *p, unsigned int p_max_size) {
-  static int ok = 1;
-  if (ok != 0) {
 #ifndef __OpenBSD__
-    ok = get_freq(p, p_max_size, "%'.2f", 1000, obj->data.i);
+  get_freq(p, p_max_size, "%'.2f", 1000, obj->data.i);
 #else
-    /* OpenBSD has no such flag (SUSv2) */
-    ok = get_freq(p, p_max_size, "%.2f", 1000, obj->data.i);
+  /* OpenBSD has no such flag (SUSv2) */
+  get_freq(p, p_max_size, "%.2f", 1000, obj->data.i);
 #endif /* __OpenBSD */
-  }
 }
 
 #ifndef __OpenBSD__
@@ -985,16 +1050,6 @@ error:
 
   if (!isdigit(static_cast<unsigned char>(*p))) { last_update = 1U; }
 }
-
-void print_stock(struct text_object *obj, char *p, unsigned int p_max_size) {
-  if (!obj->data.s) {
-    p[0] = 0;
-    return;
-  }
-  ccurl_process_info(p, p_max_size, obj->data.s, 1);
-}
-
-void free_stock(struct text_object *obj) { free(obj->data.s); }
 #endif /* BUILD_CURL */
 
 void print_to_bytes(struct text_object *obj, char *p, unsigned int p_max_size) {

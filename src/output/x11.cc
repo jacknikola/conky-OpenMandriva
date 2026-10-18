@@ -30,6 +30,7 @@
 #include "config.h"
 
 #include "../lua/x11-settings.h"
+#include "output-setting.hh"
 #include "x11-event.h"
 #include "x11.h"
 
@@ -113,12 +114,35 @@ struct conky_x11_window window;
 conky::simple_config_setting<std::string> display_name("display", std::string(),
                                                        false);
 conky::simple_config_setting<int> head_index("xinerama_head", 0, true);
-conky::simple_config_setting<bool> out_to_x("out_to_x", true, false);
 #ifdef BUILD_XFT
 conky::simple_config_setting<bool> use_xft("use_xft", false, false);
 #endif
 conky::simple_config_setting<bool> forced_redraw("forced_redraw", false, false);
-conky::simple_config_setting<bool> use_double_buffer("double_buffer", false, false);
+conky::simple_config_setting<bool> use_double_buffer("double_buffer", false,
+                                                     false);
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+/* Click-through on transparent pixels: the window's input region is rebuilt
+ * from the alpha channel of every rendered frame. */
+conky::simple_config_setting<bool> own_window_input_from_alpha(
+    "own_window_input_from_alpha", false, false);
+#endif /* BUILD_XSHAPE */
+
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+// SHAPE 1.0 has no ShapeInput. Cache per connection, not per frame/window.
+static int input_shape_supported = -1;
+extern int fixed_size, fixed_pos;
+
+static bool has_input_shape() {
+  if (input_shape_supported < 0) {
+    int event_base, error_base, major = 0, minor = 0;
+    input_shape_supported =
+        XShapeQueryExtension(display, &event_base, &error_base) &&
+        XShapeQueryVersion(display, &major, &minor) &&
+        (major > 1 || (major == 1 && minor >= 1));
+  }
+  return input_shape_supported != 0;
+}
+#endif
 
 /* local prototypes */
 static Window find_desktop_window(Window *p_root, Window *p_desktop);
@@ -248,7 +272,7 @@ inline Window DefaultVRootWindow(Display *display) {
 }
 
 /* X11 initializer */
-void init_x11() {
+bool init_x11() {
   auto _scope = LOG_SCOPE("init_x11");
   if (display == nullptr) {
     const std::string &dispstr = display_name.get(*state);
@@ -257,12 +281,8 @@ void init_x11() {
                            ? dispstr.c_str()
                            : nullptr;
     if ((display = XOpenDisplay(disp)) == nullptr) {
-#ifdef BUILD_WAYLAND
       LOG_ERROR("can't open display: {}", XDisplayName(disp));
-      return;
-#else  /* BUILD_WAYLAND */
-      SYSTEM_ERR("can't open display: {}", XDisplayName(disp));
-#endif /* BUILD_WAYLAND */
+      return false;
     }
   }
 
@@ -291,21 +311,34 @@ void init_x11() {
     }
   }
 #endif /* HAVE_XCB_ERRORS */
+  return true;
 }
 
 void deinit_x11() {
-  if (display) {
+  if (display && !g_is_reloading) {
     auto _scope = LOG_SCOPE("deinit_x11");
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+    input_shape_supported = -1;
+#endif
     XCloseDisplay(display);
     display = nullptr;
   }
 }
 
 bool x11_set_up_double_buffer(lua::state &l) {
-#ifdef BUILD_XDBE
-  // double_buffer makes no sense when not drawing to X
-  if (!out_to_x.get(l) || !display || !window.window) { return false; }
+  // double_buffer makes no sense when not drawing to a window
+  if (!display || !window.window) { return false; }
 
+  if (window.back_buffer != None) {
+#ifdef BUILD_XDBE
+    XdbeDeallocateBackBufferName(display, window.back_buffer);
+#else
+    XFreePixmap(display, window.back_buffer);
+#endif
+    window.back_buffer = None;
+  }
+
+#ifdef BUILD_XDBE
   int major, minor;
   if (XdbeQueryExtension(display, &major, &minor) == 0) {
     LOG_ERROR("no compatible double buffer extension found");
@@ -324,9 +357,6 @@ bool x11_set_up_double_buffer(lua::state &l) {
   XFlush(display);
   return true;
 #else
-  // double_buffer makes no sense when not drawing to X
-  if (!out_to_x.get(l)) return false;
-
   unsigned int depth = window.color_depth != 0 ? window.color_depth
                                                : DefaultDepth(display, screen);
   window.back_buffer =
@@ -532,16 +562,140 @@ static bool try_set_argb_visual(conky_x11_window *window) {
   return false;
 }
 
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+/* State of own_window_input_from_alpha. The shaped window is remembered by its
+ * XID so the cache can never be applied to a different (e.g. re-created)
+ * window, and so the default input region can be restored if the feature is
+ * switched off while the window is kept (config reload). */
+static Window alpha_shaped_window = None;
+
+/* Granularity of the input region, in pixels. */
+static constexpr int ALPHA_CELL = 4;
+
+/* Pixels covered by non-transparent imlib2 image pixels in the current frame
+ * (see x11_image_alpha_add), one byte per window pixel. */
+static std::vector<unsigned char> image_alpha_pixels;
+static int image_alpha_w = 0;
+static int image_alpha_h = 0;
+
+void x11_image_alpha_reset() {
+  image_alpha_pixels.clear();
+  image_alpha_w = 0;
+  image_alpha_h = 0;
+}
+
+/* argb points at the top-left pixel of a w x h region (rows are stride pixels
+ * apart) that was rendered with its top-left corner at (dst_x, dst_y) of the
+ * window. Alpha is the top byte, as in imlib2's DATA32. */
+void x11_image_alpha_add(int dst_x, int dst_y, int w, int h, int stride,
+                         const uint32_t *argb) {
+  if (argb == nullptr || w <= 0 || h <= 0 ||
+      !own_window_input_from_alpha.get(*state)) {
+    return;
+  }
+  const int ww = window.geometry.width();
+  const int wh = window.geometry.height();
+  if (ww <= 0 || wh <= 0) return;
+  if (ww != image_alpha_w || wh != image_alpha_h) {
+    image_alpha_pixels.assign(static_cast<size_t>(ww) * wh, 0);
+    image_alpha_w = ww;
+    image_alpha_h = wh;
+  }
+  for (int y = 0; y < h; ++y) {
+    const int wy = dst_y + y;
+    if (wy < 0 || wy >= wh) continue;
+    const uint32_t *row = argb + static_cast<size_t>(y) * stride;
+    unsigned char *out =
+        image_alpha_pixels.data() + static_cast<size_t>(wy) * ww;
+    for (int x = 0; x < w; ++x) {
+      const int wx = dst_x + x;
+      if (wx < 0 || wx >= ww) continue;
+      if ((row[x] >> 24) != 0) out[wx] = 1;
+    }
+  }
+}
+static std::vector<unsigned char> alpha_last_mask;
+static int alpha_last_w = -1;
+static int alpha_last_h = -1;
+
+static void reset_alpha_input_state() {
+  alpha_shaped_window = None;
+  alpha_last_mask.clear();
+  alpha_last_w = -1;
+  alpha_last_h = -1;
+}
+
+// Keep creation and reload fallback identical, including override windows,
+// whose hints are ignored. Never send ShapeInput requests to older servers.
+static void set_default_input_shape(lua::state &l) {
+  if (!has_input_shape()) return;
+  const auto type = own_window_type.get(l);
+  bool click_through =
+      type != window_type::OVERRIDE &&
+      TEST_HINT(own_window_hints.get(l), window_hints::UNDECORATED);
+#ifdef BUILD_XFIXES
+  click_through = click_through || type == window_type::UTILITY;
+#endif
+  if (click_through) {
+    XShapeCombineRectangles(display, window.window, ShapeInput, 0, 0, nullptr,
+                            0, ShapeSet, Unsorted);
+  } else {
+    XShapeCombineMask(display, window.window, ShapeInput, 0, 0, None, ShapeSet);
+  }
+}
+
+/* Undo the shape installed by update_input_shape_from_alpha(). Creation
+ * already installs this fallback, even before the first successful frame. */
+static void restore_default_input_shape() {
+  if (alpha_shaped_window != None && alpha_shaped_window == window.window &&
+      window.owned) {
+    set_default_input_shape(*state);
+  }
+  reset_alpha_input_state();
+}
+#endif /* BUILD_XSHAPE */
+
 void destroy_window() {
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+  reset_alpha_input_state();
+#endif /* BUILD_XSHAPE */
 #ifdef BUILD_XFT
   if (window.xftdraw != nullptr) { XftDrawDestroy(window.xftdraw); }
 #endif /* BUILD_XFT */
   if (window.gc != nullptr) { XFreeGC(display, window.gc); }
+  if (window.back_buffer != None) {
+#ifdef BUILD_XDBE
+    XdbeDeallocateBackBufferName(display, window.back_buffer);
+#else
+    XFreePixmap(display, window.back_buffer);
+#endif
+  }
+  if (window.owned) {
+    XDestroyWindow(display, window.window);
+    if (window.colourmap != DefaultColormap(display, screen)) {
+      XFreeColormap(display, window.colourmap);
+    }
+  }
   window = conky_x11_window{};
 }
 
 void x11_init_window(lua::state &l) {
   auto _scope = LOG_SCOPE("x11_init_window");
+
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+  // A retained opaque visual cannot acquire an alpha channel. Recreate only
+  // when ARGB is actually available, avoiding churn on unsupported servers.
+  if (window.owned && own_window.get(l) && own_window_input_from_alpha.get(l) &&
+      get_background_alpha_preference(l) < 0xff &&
+      window.color_depth != argb8888_color_depth) {
+    conky_x11_window candidate{};
+    if (try_set_argb_visual(&candidate)) {
+      XFreeColormap(display, candidate.colourmap);
+      destroy_window();
+      fixed_size = fixed_pos = 0;
+    }
+  }
+#endif
 
   window.root = VRootWindow(display, screen);
   if (window.root == None) {
@@ -550,300 +704,314 @@ void x11_init_window(lua::state &l) {
   }
   window.desktop = find_desktop_window(window.root);
 
+  /* Defaults — overridden below for own_window reuse (real window attrs)
+   * and for own_window create (ARGB visual if available). */
   window.visual = DefaultVisual(display, screen);
   window.opacity = 0xff;
   window.colourmap = DefaultColormap(display, screen);
 
 #ifdef OWN_WINDOW
   if (own_window.get(l)) {
-    int flags = CWOverrideRedirect | CWBackingStore;
-    window.color_depth = CopyFromParent;
-
-    uint8_t background_alpha = get_background_alpha_preference(l);
-    bool wants_alpha = background_alpha < 0xff;
-    LOG_DEBUG("background alpha={:#x} wants_alpha={}", background_alpha,
-              wants_alpha);
-
-    if (wants_alpha && try_set_argb_visual(&window)) {
-      window.opacity = background_alpha;
-    } else if (wants_alpha) {
-      if (background_alpha != 0) {
-        LOG_WARNING(
-            "ARGB visual not available (no compositor?), window will be "
-            "opaque");
+    if (window.owned) {
+      /* Reload path: window already alive — query its real attributes
+       * instead of destroying and recreating. */
+      XWindowAttributes attr;
+      if (XGetWindowAttributes(display, window.window, &attr) != 0) {
+        window.visual = attr.visual;
+        window.color_depth = attr.depth;
+        window.colourmap = attr.colormap;
+        window.geometry.set_size(attr.width, attr.height);
+        LOG_INFO("reusing existing window {:#x} {}x{} (reload)", window.window,
+                 attr.width, attr.height);
       } else {
-        window.opacity = 0;
-        LOG_WARNING(
-            "ARGB visual not available (no compositor?), using "
-            "pseudo-transparency fallback");
+        LOG_WARNING("XGetWindowAttributes failed for {:#x}", window.window);
+        window.visual = DefaultVisual(display, screen);
+        window.colourmap = DefaultColormap(display, screen);
       }
-    }
-
-    int b = border_inner_margin.get(l) + border_width.get(l) +
-            border_outer_margin.get(l);
-
-    /* Sanity check to avoid making an invalid 0x0 window */
-    if (b == 0) { b = 1; }
-
-    XClassHint classHint;
-
-    // class_name must be a named local variable, so that c_str() remains
-    // valid until we call XmbSetWMProperties() or XSetClassHint. We use
-    // const_cast because, for whatever reason, res_name is not declared as
-    // const char *. XmbSetWMProperties hopefully doesn't modify the value
-    // (hell, even their own example app assigns a literal string constant to
-    // the field)
-    const std::string &class_name = own_window_class.get(l);
-
-    classHint.res_name = const_cast<char *>(class_name.c_str());
-    classHint.res_class = classHint.res_name;
-
-    if (own_window_type.get(l) == window_type::OVERRIDE) {
-      /* An override_redirect True window.
-       * No WM hints or button processing needed. */
-      XSetWindowAttributes attrs = {
-          .background_pixmap = ParentRelative,
-          .backing_store = Always,
-          .event_mask = StructureNotifyMask | ExposureMask,
-          .override_redirect = True,
-      };
-      flags |= CWBackPixel;
-      if (window.opacity < 0xff) {
-        attrs.colormap = window.colourmap;
-        flags &= ~CWBackPixel;
-        flags |= CWBorderPixel | CWColormap;
-      }
-
-      /* Parent is desktop window (which might be a child of root) */
-      window.window = XCreateWindow(
-          display, window.desktop, window.geometry.x(), window.geometry.y(), b,
-          b, 0, window.color_depth, InputOutput, window.visual, flags, &attrs);
-
-      XLowerWindow(display, window.window);
-      XSetClassHint(display, window.window, &classHint);
-
-      LOG_INFO("window type - override");
-    } else { /* own_window_type.get(l) != TYPE_OVERRIDE */
-
-      /* A window managed by the window manager.
-       * Process hints and buttons. */
-      XSetWindowAttributes attrs = {
-          .background_pixmap = ParentRelative,
-          .backing_store = Always,
-          .event_mask = StructureNotifyMask | ExposureMask | ButtonPressMask |
-                        ButtonReleaseMask,
-          .override_redirect =
-              own_window_type.get(l) == window_type::UTILITY ? True : False,
-      };
-
-      XWMHints wmHint;
-      Atom xa;
-
-      flags |= CWBackPixel;
-      if (window.opacity < 0xff) {
-        attrs.colormap = window.colourmap;
-        flags &= ~CWBackPixel;
-        flags |= CWBorderPixel | CWColormap;
-      }
-
-      if (own_window_type.get(l) == window_type::DOCK) {
-        window.geometry.set_pos(conky::vec2i::Zero());
-      }
-      /* Parent is root window so WM can take control */
-      window.window = XCreateWindow(
-          display, window.root, window.geometry.x(), window.geometry.y(), b, b,
-          0, window.color_depth, InputOutput, window.visual, flags, &attrs);
-
-      uint16_t hints = own_window_hints.get(l);
-
-      wmHint.flags = InputHint | StateHint;
-      /* allow decorated windows to be given input focus by WM */
-      wmHint.input = TEST_HINT(hints, window_hints::UNDECORATED) ? False : True;
-#ifdef BUILD_XSHAPE
-#ifdef BUILD_XFIXES
-      if (own_window_type.get(l) == window_type::UTILITY) {
-        XRectangle rect;
-        XserverRegion region = XFixesCreateRegion(display, &rect, 1);
-        XFixesSetWindowShapeRegion(display, window.window, ShapeInput, 0, 0,
-                                   region);
-        XFixesDestroyRegion(display, region);
-      }
-#endif /* BUILD_XFIXES */
-      if (!wmHint.input) {
-        /* allow only decorated windows to be given mouse input */
-        int major_version;
-        int minor_version;
-        if (XShapeQueryVersion(display, &major_version, &minor_version) == 0) {
-          LOG_WARNING("input shapes are not supported");
+      uint8_t background_alpha = get_background_alpha_preference(l);
+      if (background_alpha < 0xff) {
+        if (window.visual != DefaultVisual(display, screen)) {
+          window.opacity = background_alpha;
+        } else if (background_alpha == 0) {
+          window.opacity = 0;
         } else {
-          if (own_window.get(*state) &&
-              (own_window_type.get(*state) != window_type::NORMAL ||
-               ((TEST_HINT(own_window_hints.get(*state),
-                           window_hints::UNDECORATED)) != 0))) {
-            XShapeCombineRectangles(display, window.window, ShapeInput, 0, 0,
-                                    nullptr, 0, ShapeSet, Unsorted);
+          window.opacity = 0xff;
+        }
+      } else {
+        window.opacity = 0xff;
+      }
+    } else {
+      int flags = CWOverrideRedirect | CWBackingStore;
+      window.color_depth = CopyFromParent;
+
+      uint8_t background_alpha = get_background_alpha_preference(l);
+      bool wants_alpha = background_alpha < 0xff;
+      LOG_DEBUG("background alpha={:#x} wants_alpha={}", background_alpha,
+                wants_alpha);
+
+      if (wants_alpha && try_set_argb_visual(&window)) {
+        window.opacity = background_alpha;
+      } else if (wants_alpha) {
+        if (background_alpha != 0) {
+          LOG_WARNING(
+              "ARGB visual not available (no compositor?), window will be "
+              "opaque");
+        } else {
+          window.opacity = 0;
+          LOG_WARNING(
+              "ARGB visual not available (no compositor?), using "
+              "pseudo-transparency fallback");
+        }
+      }
+
+      int b = border_inner_margin.get(l) + border_width.get(l) +
+              border_outer_margin.get(l);
+
+      /* Sanity check to avoid making an invalid 0x0 window */
+      if (b == 0) { b = 1; }
+
+      XClassHint classHint;
+
+      // class_name must be a named local variable, so that c_str() remains
+      // valid until we call XmbSetWMProperties() or XSetClassHint. We use
+      // const_cast because, for whatever reason, res_name is not declared as
+      // const char *. XmbSetWMProperties hopefully doesn't modify the value
+      // (hell, even their own example app assigns a literal string constant to
+      // the field)
+      const std::string &class_name = own_window_class.get(l);
+
+      classHint.res_name = const_cast<char *>(class_name.c_str());
+      classHint.res_class = classHint.res_name;
+
+      if (own_window_type.get(l) == window_type::OVERRIDE) {
+        /* An override_redirect True window.
+         * No WM hints or button processing needed. */
+        XSetWindowAttributes attrs = {
+            .background_pixmap = ParentRelative,
+            .backing_store = Always,
+            .event_mask = StructureNotifyMask | ExposureMask,
+            .override_redirect = True,
+        };
+        flags |= CWBackPixel;
+        if (window.opacity < 0xff) {
+          attrs.colormap = window.colourmap;
+          flags &= ~CWBackPixel;
+          flags |= CWBorderPixel | CWColormap;
+        }
+
+        /* Parent is desktop window (which might be a child of root) */
+        window.window =
+            XCreateWindow(display, window.desktop, window.geometry.x(),
+                          window.geometry.y(), b, b, 0, window.color_depth,
+                          InputOutput, window.visual, flags, &attrs);
+
+        XLowerWindow(display, window.window);
+        XSetClassHint(display, window.window, &classHint);
+
+        LOG_INFO("window type - override");
+      } else { /* own_window_type.get(l) != TYPE_OVERRIDE */
+
+        /* A window managed by the window manager.
+         * Process hints and buttons. */
+        XSetWindowAttributes attrs = {
+            .background_pixmap = ParentRelative,
+            .backing_store = Always,
+            .event_mask = StructureNotifyMask | ExposureMask | ButtonPressMask |
+                          ButtonReleaseMask,
+            .override_redirect =
+                own_window_type.get(l) == window_type::UTILITY ? True : False,
+        };
+
+        XWMHints wmHint;
+        Atom xa;
+
+        flags |= CWBackPixel;
+        if (window.opacity < 0xff) {
+          attrs.colormap = window.colourmap;
+          flags &= ~CWBackPixel;
+          flags |= CWBorderPixel | CWColormap;
+        }
+
+        if (own_window_type.get(l) == window_type::DOCK) {
+          window.geometry.set_pos(conky::vec2i::Zero());
+        }
+        /* Parent is root window so WM can take control */
+        window.window =
+            XCreateWindow(display, window.root, window.geometry.x(),
+                          window.geometry.y(), b, b, 0, window.color_depth,
+                          InputOutput, window.visual, flags, &attrs);
+
+        uint16_t hints = own_window_hints.get(l);
+
+        wmHint.flags = InputHint | StateHint;
+        /* allow decorated windows to be given input focus by WM */
+        wmHint.input =
+            TEST_HINT(hints, window_hints::UNDECORATED) ? False : True;
+#ifdef BUILD_XSHAPE
+        // Start with the normal input policy. Alpha shaping replaces it only
+        // after all prerequisites and a frame readback succeed.
+        set_default_input_shape(l);
+#endif /* BUILD_XSHAPE */
+        wmHint.initial_state = NormalState;
+        if (own_window_type.get(l) == window_type::DOCK ||
+            own_window_type.get(l) == window_type::PANEL) {
+          // Docks and panels MUST have WithdrawnState initially for Fluxbox to
+          // move the window into the slit area.
+          // See: https://github.com/brndnmtthws/conky/issues/2046
+          // But most other WMs will explicitly ignore windows in WithdrawnState
+          // See: https://github.com/brndnmtthws/conky/issues/2112
+          // So we must resort to checking for WM at runtime
+          if (info.system.wm == conky::info::window_manager::fluxbox) {
+            wmHint.initial_state = WithdrawnState;
+          }
+        }
+
+        XmbSetWMProperties(display, window.window, nullptr, nullptr, argv_copy,
+                           argc_copy, nullptr, &wmHint, &classHint);
+        XStoreName(display, window.window, own_window_title.get(l).c_str());
+
+        /* Sets an empty WM_PROTOCOLS property */
+        XSetWMProtocols(display, window.window, nullptr, 0);
+
+        /* Set window type */
+        if ((xa = ATOM(_NET_WM_WINDOW_TYPE)) != None) {
+          Atom prop;
+
+          switch (own_window_type.get(l)) {
+            case window_type::DESKTOP:
+              prop = ATOM(_NET_WM_WINDOW_TYPE_DESKTOP);
+              LOG_INFO("window type - desktop");
+              break;
+            case window_type::DOCK:
+              prop = ATOM(_NET_WM_WINDOW_TYPE_DOCK);
+              LOG_INFO("window type - dock");
+              break;
+            case window_type::PANEL:
+              prop = ATOM(_NET_WM_WINDOW_TYPE_DOCK);
+              LOG_INFO("window type - panel");
+              break;
+            case window_type::UTILITY:
+              prop = ATOM(_NET_WM_WINDOW_TYPE_UTILITY);
+              LOG_INFO("window type - utility");
+              break;
+            case window_type::NORMAL:
+            default:
+              prop = ATOM(_NET_WM_WINDOW_TYPE_NORMAL);
+              LOG_INFO("window type - normal");
+              break;
+          }
+          XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                          PropModeReplace,
+                          reinterpret_cast<unsigned char *>(&prop), 1);
+        }
+
+        /* Set desired hints */
+
+        /* Window decorations */
+        if (TEST_HINT(hints, window_hints::UNDECORATED)) {
+          LOG_DEBUG("hint - undecorated");
+          xa = ATOM(_MOTIF_WM_HINTS);
+          if (xa != None) {
+            long prop[5] = {2, 0, 0, 0, 0};
+            XChangeProperty(display, window.window, xa, xa, 32, PropModeReplace,
+                            reinterpret_cast<unsigned char *>(prop), 5);
+          }
+        }
+
+        /* Below other windows */
+        if (TEST_HINT(hints, window_hints::BELOW)) {
+          LOG_DEBUG("hint - below");
+          xa = ATOM(_WIN_LAYER);
+          if (xa != None) {
+            long prop = 0;
+
+            XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&prop), 1);
+          }
+
+          xa = ATOM(_NET_WM_STATE);
+          if (xa != None) {
+            Atom xa_prop = ATOM(_NET_WM_STATE_BELOW);
+
+            XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&xa_prop), 1);
+          }
+        }
+
+        /* Above other windows */
+        if (TEST_HINT(hints, window_hints::ABOVE)) {
+          LOG_DEBUG("hint - above");
+          xa = ATOM(_WIN_LAYER);
+          if (xa != None) {
+            long prop = 6;
+
+            XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&prop), 1);
+          }
+
+          xa = ATOM(_NET_WM_STATE);
+          if (xa != None) {
+            Atom xa_prop = ATOM(_NET_WM_STATE_ABOVE);
+
+            XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&xa_prop), 1);
+          }
+        }
+
+        /* Sticky */
+        if (TEST_HINT(hints, window_hints::STICKY)) {
+          LOG_DEBUG("hint - sticky");
+          xa = ATOM(_NET_WM_DESKTOP);
+          if (xa != None) {
+            CARD32 xa_prop = 0xFFFFFFFF;
+
+            XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&xa_prop), 1);
+          }
+
+          xa = ATOM(_NET_WM_STATE);
+          if (xa != None) {
+            Atom xa_prop = ATOM(_NET_WM_STATE_STICKY);
+
+            XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&xa_prop), 1);
+          }
+        }
+
+        /* Skip taskbar */
+        if (TEST_HINT(hints, window_hints::SKIP_TASKBAR)) {
+          LOG_DEBUG("hint - skip taskbar");
+          xa = ATOM(_NET_WM_STATE);
+          if (xa != None) {
+            Atom xa_prop = ATOM(_NET_WM_STATE_SKIP_TASKBAR);
+
+            XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&xa_prop), 1);
+          }
+        }
+
+        /* Skip pager */
+        if (TEST_HINT(hints, window_hints::SKIP_PAGER)) {
+          LOG_DEBUG("hint - skip pager");
+          xa = ATOM(_NET_WM_STATE);
+          if (xa != None) {
+            Atom xa_prop = ATOM(_NET_WM_STATE_SKIP_PAGER);
+
+            XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                            PropModeAppend,
+                            reinterpret_cast<unsigned char *>(&xa_prop), 1);
           }
         }
       }
-#endif /* BUILD_XSHAPE */
-      wmHint.initial_state = NormalState;
-      if (own_window_type.get(l) == window_type::DOCK ||
-          own_window_type.get(l) == window_type::PANEL) {
-        // Docks and panels MUST have WithdrawnState initially for Fluxbox to
-        // move the window into the slit area.
-        // See: https://github.com/brndnmtthws/conky/issues/2046
-        // But most other WMs will explicitly ignore windows in WithdrawnState
-        // See: https://github.com/brndnmtthws/conky/issues/2112
-        // So we must resort to checking for WM at runtime
-        if (info.system.wm == conky::info::window_manager::fluxbox) {
-          wmHint.initial_state = WithdrawnState;
-        }
-      }
-
-      XmbSetWMProperties(display, window.window, nullptr, nullptr, argv_copy,
-                         argc_copy, nullptr, &wmHint, &classHint);
-      XStoreName(display, window.window, own_window_title.get(l).c_str());
-
-      /* Sets an empty WM_PROTOCOLS property */
-      XSetWMProtocols(display, window.window, nullptr, 0);
-
-      /* Set window type */
-      if ((xa = ATOM(_NET_WM_WINDOW_TYPE)) != None) {
-        Atom prop;
-
-        switch (own_window_type.get(l)) {
-          case window_type::DESKTOP:
-            prop = ATOM(_NET_WM_WINDOW_TYPE_DESKTOP);
-            LOG_INFO("window type - desktop");
-            break;
-          case window_type::DOCK:
-            prop = ATOM(_NET_WM_WINDOW_TYPE_DOCK);
-            LOG_INFO("window type - dock");
-            break;
-          case window_type::PANEL:
-            prop = ATOM(_NET_WM_WINDOW_TYPE_DOCK);
-            LOG_INFO("window type - panel");
-            break;
-          case window_type::UTILITY:
-            prop = ATOM(_NET_WM_WINDOW_TYPE_UTILITY);
-            LOG_INFO("window type - utility");
-            break;
-          case window_type::NORMAL:
-          default:
-            prop = ATOM(_NET_WM_WINDOW_TYPE_NORMAL);
-            LOG_INFO("window type - normal");
-            break;
-        }
-        XChangeProperty(display, window.window, xa, XA_ATOM, 32,
-                        PropModeReplace,
-                        reinterpret_cast<unsigned char *>(&prop), 1);
-      }
-
-      /* Set desired hints */
-
-      /* Window decorations */
-      if (TEST_HINT(hints, window_hints::UNDECORATED)) {
-        LOG_DEBUG("hint - undecorated");
-        xa = ATOM(_MOTIF_WM_HINTS);
-        if (xa != None) {
-          long prop[5] = {2, 0, 0, 0, 0};
-          XChangeProperty(display, window.window, xa, xa, 32, PropModeReplace,
-                          reinterpret_cast<unsigned char *>(prop), 5);
-        }
-      }
-
-      /* Below other windows */
-      if (TEST_HINT(hints, window_hints::BELOW)) {
-        LOG_DEBUG("hint - below");
-        xa = ATOM(_WIN_LAYER);
-        if (xa != None) {
-          long prop = 0;
-
-          XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&prop), 1);
-        }
-
-        xa = ATOM(_NET_WM_STATE);
-        if (xa != None) {
-          Atom xa_prop = ATOM(_NET_WM_STATE_BELOW);
-
-          XChangeProperty(display, window.window, xa, XA_ATOM, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&xa_prop), 1);
-        }
-      }
-
-      /* Above other windows */
-      if (TEST_HINT(hints, window_hints::ABOVE)) {
-        LOG_DEBUG("hint - above");
-        xa = ATOM(_WIN_LAYER);
-        if (xa != None) {
-          long prop = 6;
-
-          XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&prop), 1);
-        }
-
-        xa = ATOM(_NET_WM_STATE);
-        if (xa != None) {
-          Atom xa_prop = ATOM(_NET_WM_STATE_ABOVE);
-
-          XChangeProperty(display, window.window, xa, XA_ATOM, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&xa_prop), 1);
-        }
-      }
-
-      /* Sticky */
-      if (TEST_HINT(hints, window_hints::STICKY)) {
-        LOG_DEBUG("hint - sticky");
-        xa = ATOM(_NET_WM_DESKTOP);
-        if (xa != None) {
-          CARD32 xa_prop = 0xFFFFFFFF;
-
-          XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&xa_prop), 1);
-        }
-
-        xa = ATOM(_NET_WM_STATE);
-        if (xa != None) {
-          Atom xa_prop = ATOM(_NET_WM_STATE_STICKY);
-
-          XChangeProperty(display, window.window, xa, XA_ATOM, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&xa_prop), 1);
-        }
-      }
-
-      /* Skip taskbar */
-      if (TEST_HINT(hints, window_hints::SKIP_TASKBAR)) {
-        LOG_DEBUG("hint - skip taskbar");
-        xa = ATOM(_NET_WM_STATE);
-        if (xa != None) {
-          Atom xa_prop = ATOM(_NET_WM_STATE_SKIP_TASKBAR);
-
-          XChangeProperty(display, window.window, xa, XA_ATOM, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&xa_prop), 1);
-        }
-      }
-
-      /* Skip pager */
-      if (TEST_HINT(hints, window_hints::SKIP_PAGER)) {
-        LOG_DEBUG("hint - skip pager");
-        xa = ATOM(_NET_WM_STATE);
-        if (xa != None) {
-          Atom xa_prop = ATOM(_NET_WM_STATE_SKIP_PAGER);
-
-          XChangeProperty(display, window.window, xa, XA_ATOM, 32,
-                          PropModeAppend,
-                          reinterpret_cast<unsigned char *>(&xa_prop), 1);
-        }
-      }
-    }
+      window.owned = true;
+    } /* end of else — create new window */
 
     LOG_INFO("drawing to created window {:#x}", window.window);
     XMapWindow(display, window.window);
@@ -917,8 +1085,17 @@ void x11_init_window(lua::state &l) {
 
     if (own_window.get(l)) {
       selected_events.clear_all();
-      selected_events.set(XI_ButtonPress);
-      selected_events.set(XI_ButtonRelease);
+      // Desktop windows rely on an empty XShape input region for
+      // click-through; only grab buttons if a mouse hook actually wants them.
+      bool wants_button_events = own_window_type.get(l) != window_type::DESKTOP;
+#ifdef BUILD_MOUSE_EVENTS
+      wants_button_events =
+          wants_button_events || !conky::lua_mouse_hook.get(l).empty();
+#endif /* BUILD_MOUSE_EVENTS */
+      if (wants_button_events) {
+        selected_events.set(XI_ButtonPress);
+        selected_events.set(XI_ButtonRelease);
+      }
       // It's not recommended to add event masks to special windows in X; causes
       // a crash (thus own_window_type != window_type::DESKTOP)
       if (own_window_type.get(l) != window_type::DESKTOP) {
@@ -945,8 +1122,6 @@ void x11_init_window(lua::state &l) {
 #endif /* OWN_WINDOW */
   window.event_mask = input_mask;
   XSelectInput(display, window.window, input_mask);
-
-  window_created = 1;
 }
 
 static Window find_desktop_window_impl(Window win, int w, int h) {
@@ -980,6 +1155,10 @@ static Window find_desktop_window_impl(Window win, int w, int h) {
 }
 
 void create_gc() {
+  if (window.gc != nullptr) {
+    XFreeGC(display, window.gc);
+    window.gc = nullptr;
+  }
   XGCValues values;
 
   values.graphics_exposures = 0;
@@ -1115,7 +1294,7 @@ static const char NOT_IN_X[] = "Not running in X";
 void print_monitor(struct text_object *obj, char *p, unsigned int p_max_size) {
   (void)obj;
 
-  if (!out_to_x.get(*state)) {
+  if (!conky::output_enabled(conky::output_t::X11)) {
     strncpy(p, NOT_IN_X, p_max_size);
     return;
   }
@@ -1126,7 +1305,7 @@ void print_monitor_number(struct text_object *obj, char *p,
                           unsigned int p_max_size) {
   (void)obj;
 
-  if (!out_to_x.get(*state)) {
+  if (!conky::output_enabled(conky::output_t::X11)) {
     strncpy(p, NOT_IN_X, p_max_size);
     return;
   }
@@ -1136,7 +1315,7 @@ void print_monitor_number(struct text_object *obj, char *p,
 void print_desktop(struct text_object *obj, char *p, unsigned int p_max_size) {
   (void)obj;
 
-  if (!out_to_x.get(*state)) {
+  if (!conky::output_enabled(conky::output_t::X11)) {
     strncpy(p, NOT_IN_X, p_max_size);
     return;
   }
@@ -1147,7 +1326,7 @@ void print_desktop_number(struct text_object *obj, char *p,
                           unsigned int p_max_size) {
   (void)obj;
 
-  if (!out_to_x.get(*state)) {
+  if (!conky::output_enabled(conky::output_t::X11)) {
     strncpy(p, NOT_IN_X, p_max_size);
     return;
   }
@@ -1158,7 +1337,7 @@ void print_desktop_name(struct text_object *obj, char *p,
                         unsigned int p_max_size) {
   (void)obj;
 
-  if (!out_to_x.get(*state)) {
+  if (!conky::output_enabled(conky::output_t::X11)) {
     strncpy(p, NOT_IN_X, p_max_size);
   } else {
     strncpy(p, info.x11.desktop.name.c_str(), p_max_size);
@@ -1430,7 +1609,172 @@ void set_struts() {
 }
 #endif /* OWN_WINDOW */
 
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+/* Rebuild the window's input region from the alpha channel of the frame that
+ * is about to be shown, so clicks on (nearly) transparent pixels fall through
+ * to whatever is below, while text/graphics still receive clicks.
+ * Works on cells of CELL x CELL pixels so gaps between glyphs stay clickable.
+ */
+static void update_input_shape_from_alpha() {
+  constexpr int CELL = ALPHA_CELL;
+  static bool warned = false;
+
+  const bool wanted = window.owned && own_window.get(*state) &&
+                      own_window_input_from_alpha.get(*state);
+  const bool supported = has_input_shape() && use_double_buffer.get(*state) &&
+                         window.color_depth == argb8888_color_depth;
+  if (!wanted || !supported) {
+    /* leaving the enabled state: don't leave a stale region on the window */
+    restore_default_input_shape();
+    if (wanted && !warned) {
+      LOG_WARNING(
+          "own_window_input_from_alpha needs SHAPE 1.1, double_buffer = true "
+          "and an ARGB visual; ignoring");
+      warned = true;
+    }
+    return;
+  }
+
+  /* a different window than the one we shaped: its cache doesn't apply */
+  if (window.window != alpha_shaped_window) {
+    alpha_last_mask.clear();
+    alpha_last_w = -1;
+    alpha_last_h = -1;
+  }
+
+  // During auto-sizing, draw_stuff() can run after the logical geometry
+  // grows but before XResizeWindow updates the XDBE drawable (or before the
+  // pixmap is replaced). Reading the requested size then causes BadMatch.
+  // Shape only the frame that actually exists; use its size in the cache so
+  // the first frame after the real resize cannot reuse the old input mask.
+  Window root;
+  int x, y;
+  unsigned int drawable_w, drawable_h, border, depth;
+  if (!XGetGeometry(display, window.drawable, &root, &x, &y, &drawable_w,
+                    &drawable_h, &border, &depth)) {
+    return;
+  }
+  const int w = std::min(window.geometry.width(), static_cast<int>(drawable_w));
+  const int h =
+      std::min(window.geometry.height(), static_cast<int>(drawable_h));
+  if (w <= 0 || h <= 0) return;
+
+  XImage *img =
+      XGetImage(display, window.drawable, 0, 0, w, h, AllPlanes, ZPixmap);
+  if (img == nullptr) return;
+
+  const int cols = (w + CELL - 1) / CELL;
+  const int rows = (h + CELL - 1) / CELL;
+  std::vector<unsigned char> mask(static_cast<size_t>(cols) * rows, 0);
+  // Pixmap XGetImage results have no associated visual and may report zero
+  // RGB masks. Use the window visual, or colored transparent pixels would be
+  // mistaken for opaque pixels in the pixmap back buffer.
+  const unsigned long alpha_mask =
+      ~(window.visual->red_mask | window.visual->green_mask |
+        window.visual->blue_mask) &
+      0xffffffffUL;
+  if (alpha_mask != 0) {
+    int shift = 0;
+    while (((alpha_mask >> shift) & 1UL) == 0) ++shift;
+    const unsigned long rgb_mask = ~alpha_mask & 0xffffffffUL;
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const unsigned long pixel = XGetPixel(img, x, y);
+        bool opaque = ((pixel & alpha_mask) >> shift) != 0;
+        /* imlib2 writes only RGB, so a non-transparent image pixel has zero
+         * alpha in the frame. Count it, but only while it still has color:
+         * drawing that cleared it later in the frame (e.g. from a lua draw
+         * hook) leaves an all-zero pixel, which must not take input. */
+        if (!opaque && (pixel & rgb_mask) != 0 && x < image_alpha_w &&
+            y < image_alpha_h) {
+          opaque = image_alpha_pixels[static_cast<size_t>(y) * image_alpha_w +
+                                      x] != 0;
+        }
+        if (opaque) {
+          mask[static_cast<size_t>(y / CELL) * cols + (x / CELL)] = 1;
+        }
+      }
+    }
+  }
+  XDestroyImage(img);
+
+  if (window.window == alpha_shaped_window && w == alpha_last_w &&
+      h == alpha_last_h && mask == alpha_last_mask) {
+    return;
+  }
+  alpha_last_w = w;
+  alpha_last_h = h;
+  alpha_last_mask = mask;
+
+  /* run-length per row, merging identical runs of consecutive rows */
+  std::vector<XRectangle> rects;
+  std::vector<size_t> prev_open;  // indices into rects, still extendable
+  for (int r = 0; r < rows; ++r) {
+    std::vector<size_t> cur_open;
+    int c = 0;
+    while (c < cols) {
+      if (!mask[static_cast<size_t>(r) * cols + c]) {
+        ++c;
+        continue;
+      }
+      int start = c;
+      while (c < cols && mask[static_cast<size_t>(r) * cols + c]) ++c;
+      const short rx = static_cast<short>(start * CELL);
+      const unsigned short rw = static_cast<unsigned short>((c - start) * CELL);
+      bool merged = false;
+      for (size_t idx : prev_open) {
+        if (rects[idx].x == rx && rects[idx].width == rw) {
+          rects[idx].height += CELL;
+          cur_open.push_back(idx);
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        rects.push_back(XRectangle{rx, static_cast<short>(r * CELL), rw,
+                                   static_cast<unsigned short>(CELL)});
+        cur_open.push_back(rects.size() - 1);
+      }
+    }
+    prev_open.swap(cur_open);
+  }
+
+  /* An empty list gives an empty region: everything is click-through.
+   * XShapeCombineRectangles does not split its payload, and a single request
+   * must fit the server's maximum request size (at least 16 KiB by protocol,
+   * and smaller for some proxies). So a fragmented mask is sent in chunks sized
+   * from XMaxRequestSize(): the first replaces the region (ShapeSet), the rest
+   * are added to it (ShapeUnion). */
+  constexpr size_t MAX_RECTS_PER_REQUEST = 8192;
+  /* ShapeRectangles header is 16 bytes; keep a little extra headroom */
+  constexpr size_t REQUEST_HEADER_BYTES = 32;
+  const size_t max_request_bytes =
+      static_cast<size_t>(XMaxRequestSize(display)) * 4;
+  const size_t rects_per_request = std::clamp<size_t>(
+      max_request_bytes > REQUEST_HEADER_BYTES
+          ? (max_request_bytes - REQUEST_HEADER_BYTES) / sizeof(XRectangle)
+          : 1,
+      1, MAX_RECTS_PER_REQUEST);
+  if (rects.empty()) {
+    XShapeCombineRectangles(display, window.window, ShapeInput, 0, 0, nullptr,
+                            0, ShapeSet, Unsorted);
+  } else {
+    for (size_t offset = 0; offset < rects.size();
+         offset += rects_per_request) {
+      const size_t count = std::min(rects_per_request, rects.size() - offset);
+      XShapeCombineRectangles(display, window.window, ShapeInput, 0, 0,
+                              rects.data() + offset, static_cast<int>(count),
+                              offset == 0 ? ShapeSet : ShapeUnion, Unsorted);
+    }
+  }
+  alpha_shaped_window = window.window;
+}
+#endif /* BUILD_XSHAPE */
+
 void swap_x11_buffers() {
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+  update_input_shape_from_alpha();
+#endif /* BUILD_XSHAPE */
 #ifdef BUILD_XDBE
   if (use_double_buffer.get(*state)) {
     XdbeSwapInfo swap;
@@ -1439,7 +1783,7 @@ void swap_x11_buffers() {
     swap.swap_action = XdbeBackground;
     XdbeSwapBuffers(display, &swap, 1);
   }
-#else /* BUILD_XDBE */
+#else  /* BUILD_XDBE */
   if (use_double_buffer.get(*state)) {
     XCopyArea(display, window.back_buffer, window.window, window.gc, 0, 0,
               window.geometry.width(), window.geometry.height(), 0, 0);

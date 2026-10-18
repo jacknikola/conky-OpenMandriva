@@ -28,7 +28,7 @@ cleanup () {
 trap cleanup EXIT
 
 # store repo root as variable
-REPO_ROOT=$(readlink -f $(dirname $(dirname $0)))
+REPO_ROOT=$(readlink -f "$(dirname "$(dirname "$0")")")
 OLD_CWD=$(readlink -f .)
 
 # check if we have a recent enough version of librsvg
@@ -45,7 +45,7 @@ pushd "$BUILD_DIR"
 # we need to explicitly set the install prefix, as CMake's default is /usr/local for some reason...
 cmake -G Ninja                         \
   -DCMAKE_BUILD_TYPE=$MODE             \
-  -DRELEASE=$RELEASE                   \
+  -DRELEASE="$RELEASE"                 \
   -DBUILD_AUDACIOUS=ON                 \
   -DBUILD_DOCS=ON                      \
   -DBUILD_HTTP=ON                      \
@@ -73,34 +73,34 @@ cmake -G Ninja                         \
 cmake --build .
 cmake --install .
 
-wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+# linuxdeploy/appimagetool publish per-arch AppImages; the tool names follow
+# uname -m (x86_64/aarch64), matching the runner architecture.
+TOOL_ARCH=$(uname -m)
+LINUXDEPLOY="linuxdeploy-${TOOL_ARCH}.AppImage"
+wget "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/${LINUXDEPLOY}"
 
 # make them executable
-chmod +x linuxdeploy-x86_64.AppImage
+chmod +x "${LINUXDEPLOY}"
 
-./linuxdeploy-x86_64.AppImage \
+./"${LINUXDEPLOY}" \
   --appdir AppDir \
   -e AppDir/usr/bin/conky \
   -i AppDir/usr/share/icons/hicolor/scalable/apps/conky-logomark-violet.svg \
   -d AppDir/usr/share/applications/conky.desktop
 
-wget https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+APPIMAGETOOL="appimagetool-${TOOL_ARCH}.AppImage"
+wget "https://github.com/AppImage/appimagetool/releases/download/continuous/${APPIMAGETOOL}"
 
-chmod +x appimagetool-x86_64.AppImage
+chmod +x "${APPIMAGETOOL}"
 
 GPG_KEY=C793F1BA
 if gpg --list-keys ${GPG_KEY}; then
-  ./appimagetool-x86_64.AppImage AppDir --sign --sign-key ${GPG_KEY}
+  ./"${APPIMAGETOOL}" AppDir --sign --sign-key ${GPG_KEY}
 else
-  ./appimagetool-x86_64.AppImage AppDir
+  ./"${APPIMAGETOOL}" AppDir
 fi
 
-for f in conky*.AppImage
-do
-  sha256sum $f > $f.sha256
-done
-
-mv conky*.AppImage* "$OLD_CWD"
+mv conky*.AppImage "$OLD_CWD"
 
 # gzip & copy the man page, which will be attached to releases
 gzip doc/conky.1

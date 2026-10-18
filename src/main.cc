@@ -146,9 +146,6 @@ static void print_version() {
 #ifdef HAVE_SOUNDCARD_H
             << _("  * OSS mixer support\n")
 #endif /* HAVE_SOUNDCARD_H */
-#ifdef BUILD_MIXER_ALSA
-            << _("  * ALSA mixer support\n")
-#endif /* BUILD_MIXER_ALSA */
 #ifdef BUILD_APCUPSD
             << _("  * apcupsd\n")
 #endif /* BUILD_APCUPSD */
@@ -308,8 +305,9 @@ inline void reset_optind() {
 #endif
 }
 
-void clean_up(void);      // defined in conky.cc
-void handle_terminate();  // defined in conky.cc
+void clean_up(void);             // defined in conky.cc
+void handle_terminate();         // defined in conky.cc
+void populate_system_details();  // defined in system-details.cc
 
 int main(int argc, char **argv) {
   conky::log::init_logger();
@@ -320,6 +318,8 @@ int main(int argc, char **argv) {
   bindtextdomain(PACKAGE_NAME, LOCALE_DIR);
   textdomain(PACKAGE_NAME);
 #endif
+  populate_system_details();
+
   argc_copy = argc;
   argv_copy = argv;
   g_sigterm_pending = 0;

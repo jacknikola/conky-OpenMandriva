@@ -28,6 +28,8 @@
 #include <limits>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "../lua/luamm.hh"
 #include "display-output.hh"
@@ -43,8 +45,6 @@ class display_output_http : public display_output_base {
 
   virtual ~display_output_http() {}
 
-  // check if available and enabled in settings
-  virtual bool detect();
   // connect to DISPLAY and other stuff
   virtual bool initialize();
   virtual bool shutdown();
@@ -62,6 +62,13 @@ class display_output_http : public display_output_base {
 };
 
 std::string html_escape(const std::string &input);
+
+// Response built from the user's lua_http_response_hook, if configured.
+struct http_response {
+  std::string body;
+  int status = 200;
+  std::vector<std::pair<std::string, std::string>> headers;
+};
 
 }  // namespace conky
 

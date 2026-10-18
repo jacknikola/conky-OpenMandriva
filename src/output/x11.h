@@ -90,6 +90,8 @@ struct conky_x11_window {
   Window root;
   /// XID of Conky window
   Window window;
+  /// Whether Conky created this window (never true for the desktop/root).
+  bool owned = false;
   /// XID of DE desktop window (or root if none)
   Window desktop;
   Drawable drawable;
@@ -149,7 +151,7 @@ extern struct conky_x11_window window;
 
 void update_x11_resource_db(bool first_run = false);
 void update_x11_workarea();
-void init_x11();
+bool init_x11();
 void destroy_window(void);
 void create_gc(void);
 void set_transparent_background(conky_x11_window *win);
@@ -238,5 +240,19 @@ std::vector<Window> query_x11_windows_at_pos(
     bool eager = false);
 
 void swap_x11_buffers();
+
+/* Alpha of images drawn through imlib2, for own_window_input_from_alpha.
+ * imlib2 renders only RGB onto the window, so the frame's alpha channel does
+ * not know about ${image} pixels. cimlib_render() reports the alpha of its
+ * buffer here instead; the input shape update merges it with the alpha read
+ * back from the frame. Both are no-ops unless the feature is enabled. */
+#if defined(BUILD_XSHAPE) && defined(OWN_WINDOW)
+void x11_image_alpha_reset();
+void x11_image_alpha_add(int dst_x, int dst_y, int w, int h, int stride,
+                         const uint32_t *argb);
+#else
+inline void x11_image_alpha_reset() {}
+inline void x11_image_alpha_add(int, int, int, int, int, const uint32_t *) {}
+#endif
 
 #endif /* CONKY_X11_H */

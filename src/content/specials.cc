@@ -26,28 +26,25 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
-#include "../conky.h"
-#ifdef BUILD_GUI
-#include "../lua/fonts.h"
-#include "../output/gui.h"
-#endif /* BUILD_GUI */
-#include <cmath>
-#include "../logging.h"
 #include "specials.h"
+
+#include <cmath>
 #ifdef HAVE_SYS_PARAM_H
 #include <sys/param.h>
 #endif /* HAVE_SYS_PARAM_H */
 #include <algorithm>
 #include <functional>
 #include <sstream>
+
+#ifdef BUILD_GUI
+#include "../lua/fonts.h"
+#endif /* BUILD_GUI */
 #include "../common.h"
 #include "../conky.h"
+#include "../logging.h"
 #include "../output/display-output.hh"
+#include "../output/output-setting.hh"
 #include "colours.hh"
-
-#ifdef BUILD_NCURSES
-extern conky::simple_config_setting<bool> out_to_ncurses;
-#endif
 
 struct special_node *specials = nullptr;
 
@@ -55,6 +52,8 @@ int special_count;
 double maxspeedval = 1e-47; /* The maximum value among the speed graphs */
 
 namespace {
+bool specials_are_temporary = false;
+
 conky::range_config_setting<int> default_bar_width(
     "default_bar_width", 0, std::numeric_limits<int>::max(), 0, false);
 conky::range_config_setting<int> default_bar_height(
@@ -433,6 +432,30 @@ done:
  * Printing various special text objects
  */
 
+temporary_specials::temporary_specials()
+    : saved_specials(specials),
+      saved_count(special_count),
+      saved_maxspeedval(maxspeedval),
+      saved_color(get_current_text_color()),
+      saved_temporary(specials_are_temporary) {
+  specials = nullptr;
+  special_count = 0;
+  specials_are_temporary = true;
+}
+
+temporary_specials::~temporary_specials() {
+  while (specials != nullptr) {
+    auto *next = specials->next;
+    delete specials;
+    specials = next;
+  }
+  specials = saved_specials;
+  special_count = saved_count;
+  maxspeedval = saved_maxspeedval;
+  set_current_text_color(saved_color);
+  specials_are_temporary = saved_temporary;
+}
+
 struct special_node *new_special_t_node() { return new special_node{}; }
 
 /**
@@ -521,6 +544,10 @@ void new_font(struct text_object *obj, char *p, unsigned int p_max_size) {
   if (p_max_size == 0) { return; }
 
   s = new_special(p, text_node_t::FONT);
+
+  // The marker is still needed so no_update can strip it and warn, but a
+  // discarded font must not allocate a new backend font on every evaluation.
+  if (specials_are_temporary) { return; }
 
   if (obj->data.s != nullptr) {
     if (s->font_added >= static_cast<int>(fonts.size()) ||
@@ -742,14 +769,10 @@ void new_stippled_hr(struct text_object *obj, char *p,
 #endif /* BUILD_GUI */
 
 void new_fg(struct text_object *obj, char *p, unsigned int p_max_size) {
-  if (false
-#ifdef BUILD_GUI
-      || (display_output() && display_output()->graphical())
-#endif /* BUILD_GUI */
-#ifdef BUILD_NCURSES
-      || out_to_ncurses.get(*state)
-#endif /* BUILD_NCURSES */
-  ) {
+  // Text is generated in update_text(), before draw_stuff() selects an active
+  // output — so query the resolved set, not the thread-local active output.
+  if (conky::output_enabled({conky::output_t::X11, conky::output_t::WAYLAND,
+                             conky::output_t::NCURSES})) {
     new_special(p, text_node_t::FG)->arg = obj->data.l;
   }
   UNUSED(obj);

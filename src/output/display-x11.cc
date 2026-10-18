@@ -115,33 +115,6 @@ struct x_font_list {
 
 static std::vector<x_font_list> x_fonts; /* indexed by selected_font */
 
-#ifdef BUILD_XFT
-namespace {
-class xftalpha_setting : public conky::simple_config_setting<float> {
-  using Base = conky::simple_config_setting<float>;
-
- protected:
-  void lua_setter(lua::state &l, bool init) override {
-    lua::stack_sentry s(l, -2);
-
-    Base::lua_setter(l, init);
-
-    if (init && out_to_x.get(*state)) {
-      x_fonts.resize(std::max(1, static_cast<int>(fonts.size())));
-      x_fonts[0].font_alpha = do_convert(l, -1).first * 0xffff;
-    }
-
-    ++s;
-  }
-
- public:
-  xftalpha_setting() : Base("xftalpha", 1.0, false) {}
-};
-
-xftalpha_setting xftalpha;
-}  // namespace
-#endif /* BUILD_XFT */
-
 static void X11_create_window();
 
 void update_dpi() {
@@ -171,8 +144,10 @@ void update_dpi() {
 
 static void X11_create_window() {
   if (!window.window) { return; }
-  setup_fonts();
+  // Load before setup: setup_fonts() forwards set_font(0), which warns when
+  // the backend cache is still empty.
   load_fonts(utf8_mode.get(*state));
+  setup_fonts();
   update_dpi();
   update_text_area(); /* to position text/window on screen */
 
@@ -216,28 +191,24 @@ namespace {
 conky::display_output_x11 x11_output;
 }  // namespace
 
-template <>
-void register_output<output_t::X11>(display_outputs_t &outputs) {
-  outputs.push_back(&x11_output);
-}
-
-display_output_x11::display_output_x11() : display_output_base("x11") {
+display_output_x11::display_output_x11()
+    : display_output_base("x11", output_t::X11) {
   is_graphical = true;
-}
-
-bool display_output_x11::detect() {
-  if (out_to_x.get(*state)) {
-    LOG_DEBUG("display output '{}' enabled in config", name);
-    return true;
-  }
-  return false;
 }
 
 bool display_output_x11::initialize() {
   // X global state is set up here rather than in lua config setters, so the
   // settings stay side-effect-free. Order mirrors the settings: open the
   // display, create the window, set up double buffering, then imlib.
-  init_x11();
+  if (!init_x11()) { return false; }
+#ifdef OWN_WINDOW
+  if (window.window == None || window.owned != own_window.get(*state)) {
+    // The retained drawable belongs to the old mode. Do not adopt an owned
+    // window as the desktop, or carry the desktop's geometry into a new one.
+    destroy_window();
+    fixed_size = fixed_pos = 0;
+  }
+#endif
   x11_init_window(*state);
 
   if (use_double_buffer.get(*state)) {
@@ -276,7 +247,7 @@ bool display_output_x11::main_loop_wait(double t) {
 
   if (XPending(display) == 0) {
     fd_set fdsr;
-    struct timeval tv{};
+    struct timeval tv {};
     int s;
     // t = next_update_time - get_time();
 
@@ -460,17 +431,17 @@ bool handle_event(conky::display_output_x11 *surface, Display *display,
                   xi_pointer_enter ev, conky::x11::event *propagated) {
   if (!own_window.get(*state)) {
     if (!window.cursor_over_window) {
-      llua_mouse_hook(mouse_crossing_event(mouse_event_t::AREA_ENTER,
-                                            ev.pos_absolute - window.geometry.pos(),
-                                            ev.pos_absolute));
+      llua_mouse_hook(mouse_crossing_event(
+          mouse_event_t::AREA_ENTER, ev.pos_absolute - window.geometry.pos(),
+          ev.pos_absolute));
       window.cursor_over_window = true;
     }
-    
+
     *propagated = ev;
   } else {
-    llua_mouse_hook(mouse_crossing_event(mouse_event_t::AREA_ENTER,
-                                          ev.pos_absolute - window.geometry.pos(),
-                                          ev.pos_absolute));
+    llua_mouse_hook(mouse_crossing_event(
+        mouse_event_t::AREA_ENTER, ev.pos_absolute - window.geometry.pos(),
+        ev.pos_absolute));
   }
   return true;
 }
@@ -479,17 +450,17 @@ bool handle_event(conky::display_output_x11 *surface, Display *display,
                   xi_pointer_leave ev, conky::x11::event *propagated) {
   if (!own_window.get(*state)) {
     if (window.cursor_over_window) {
-      llua_mouse_hook(mouse_crossing_event(mouse_event_t::AREA_LEAVE,
-                                           ev.pos_absolute - window.geometry.pos(),
-                                           ev.pos_absolute));
+      llua_mouse_hook(mouse_crossing_event(
+          mouse_event_t::AREA_LEAVE, ev.pos_absolute - window.geometry.pos(),
+          ev.pos_absolute));
       window.cursor_over_window = false;
     }
-    
+
     *propagated = ev;
   } else {
-    llua_mouse_hook(mouse_crossing_event(mouse_event_t::AREA_LEAVE,
-                                         ev.pos_absolute - window.geometry.pos(),
-                                         ev.pos_absolute));
+    llua_mouse_hook(mouse_crossing_event(
+        mouse_event_t::AREA_LEAVE, ev.pos_absolute - window.geometry.pos(),
+        ev.pos_absolute));
   }
   return true;
 }
@@ -501,7 +472,7 @@ bool handle_event(conky::display_output_x11 *surface, Display *display,
 
 #ifdef BUILD_MOUSE_EVENTS
   modifier_state_t mods = x11_modifier_state(ev.mods.effective);
-  
+
   bool has_move_x = ev.test_valuator(valuator_t::MOVE_X);
   bool has_move_y = ev.test_valuator(valuator_t::MOVE_Y);
   bool has_scroll_x = ev.test_valuator(valuator_t::SCROLL_X);
@@ -527,8 +498,8 @@ bool handle_event(conky::display_output_x11 *surface, Display *display,
         window.cursor_over_window = true;
       } else if (window.cursor_over_window) {
         llua_mouse_hook(mouse_crossing_event(
-            mouse_event_t::AREA_LEAVE,
-            ev.pos_absolute - window.geometry.pos(), ev.pos_absolute));
+            mouse_event_t::AREA_LEAVE, ev.pos_absolute - window.geometry.pos(),
+            ev.pos_absolute));
         window.cursor_over_window = false;
       }
     }
@@ -537,7 +508,7 @@ bool handle_event(conky::display_output_x11 *surface, Display *display,
     // in any other case, this check does nothing.
     if (!cursor_over_conky) { return true; }
   }
-  
+
   LOG_TRACE_WITH(({"move_x", has_move_x}, {"move_y", has_move_y},
                   {"scroll_x", has_scroll_x}, {"scroll_y", has_scroll_y}),
                  "xi motion: is_move={} is_scroll={}", is_move, is_scroll);
@@ -871,32 +842,43 @@ void display_output_x11::sigterm_cleanup() {
     XDamageDestroy(display, window.window_damage);
     XFixesDestroyRegion(display, window.damage_region);
     XFixesDestroyRegion(display, window.damage_scratch);
+    window.window_damage = 0;
   }
 #endif /* BUILD_XDAMAGE */
 }
 
 void display_output_x11::cleanup() {
-  if (window_created == 1) {
+  if (window.window != None && (!g_is_reloading || !window.owned)) {
     int border_total = get_border_total();
 
     XClearArea(display, window.window, text_start.x() - border_total,
                text_start.y() - border_total, text_size.x() + 2 * border_total,
                text_size.y() + 2 * border_total, 0);
   }
-  destroy_window();
   free_fonts(utf8_mode.get(*state));
   if (window.repaint_region != nullptr) {
     XDestroyRegion(window.repaint_region);
     window.repaint_region = nullptr;
   }
+#ifdef BUILD_XDAMAGE
+  if (window.window_damage) {
+    XDamageDestroy(display, window.window_damage);
+    XFixesDestroyRegion(display, window.damage_region);
+    XFixesDestroyRegion(display, window.damage_scratch);
+    window.window_damage = 0;
+  }
+#endif /* BUILD_XDAMAGE */
+  if (!g_is_reloading) { destroy_window(); }
 }
 
 void display_output_x11::set_foreground_color(Colour c) {
   current_color = c;
-  current_color.alpha = window.opacity;
+  // Foreground alpha is independent of the window background. GC drawing
+  // writes pixels directly, so ARGB drawables need premultiplied colors.
   XSetForeground(
       display, window.gc,
-      current_color.to_x11_color(display, screen, window.opacity < 0xff));
+      current_color.to_x11_color(
+          display, screen, window.color_depth == argb8888_color_depth, true));
 }
 
 int display_output_x11::calc_text_width(const char *s) {
@@ -925,8 +907,9 @@ void display_output_x11::draw_string_at(int x, int y, const char *s, int w) {
     XColor c{};
     XftColor c2{};
 
-    c.pixel =
-        current_color.to_x11_color(display, screen, window.opacity < 0xff);
+    // Pseudo-transparency still uses an RGB colormap: never pack alpha there.
+    c.pixel = current_color.to_x11_color(
+        display, screen, window.color_depth == argb8888_color_depth);
     // query color on custom colormap
     XQueryColor(display, window.colourmap, &c);
 
@@ -994,9 +977,7 @@ float display_output_x11::get_dpi_scale() {
   return 1.0;
 }
 
-void display_output_x11::end_draw_stuff() {
-  swap_x11_buffers();
-}
+void display_output_x11::end_draw_stuff() { swap_x11_buffers(); }
 
 void display_output_x11::clear_text(int exposures) {
   if (use_double_buffer.get(*state)) {
@@ -1006,8 +987,8 @@ void display_output_x11::clear_text(int exposures) {
 #ifndef BUILD_XDBE
   else
 #endif
-  if ((display != nullptr) &&
-      (window.window != 0u)) {  // make sure these are !null
+      if ((display != nullptr) &&
+          (window.window != 0u)) {  // make sure these are !null
     /* there is some extra space for borders and outlines */
     int border_total = get_border_total();
 
@@ -1118,6 +1099,16 @@ void display_output_x11::free_fonts(bool utf8) {
 #endif /* BUILD_XFT */
 }
 void display_output_x11::load_fonts(bool utf8) {
+#ifdef BUILD_XFT
+  if (x_fonts.empty() && !fonts.empty() && use_xft.get(*state)) {
+    // Xft 2.3.4 registers its close hook before initializing Render, but its
+    // cached glyph cleanup still needs Render at XCloseDisplay(). Initialize
+    // Render first so its hook runs after Xft's, without recreating a Render
+    // cache whose extension codes are freed when the display closes.
+    int event_base, error_base;
+    XRenderQueryExtension(display, &event_base, &error_base);
+  }
+#endif
   x_fonts.resize(fonts.size());
   for (unsigned int i = 0; i < fonts.size(); i++) {
     auto &font = fonts[i];
@@ -1167,15 +1158,20 @@ void display_output_x11::load_fonts(bool utf8) {
       }
     }
   }
+#ifdef BUILD_XFT
+  if (!x_fonts.empty()) {
+    x_fonts[0].font_alpha = static_cast<int>(text_alpha.get(*state) * 0xffff);
+  }
+#endif /* BUILD_XFT */
 }
 
 void display_output_x11::update_surface() {
-  #ifdef BUILD_LUA_CAIRO_XLIB
+#ifdef BUILD_LUA_CAIRO_XLIB
   current_surface.reset(cairo_xlib_surface_create(
                             display, window.drawable, window.visual,
                             window.geometry.width(), window.geometry.height()),
                         cairo_surface_destroy);
-  #endif /* BUILD_LUA_CAIRO_XLIB */
+#endif /* BUILD_LUA_CAIRO_XLIB */
 }
 
 std::weak_ptr<conky::draw_surface> display_output_x11::drawing_surface() {
